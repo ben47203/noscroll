@@ -1,0 +1,9 @@
+# Runtime state — never commit personal data
+.noscroll_sites
+.noscroll_hash
+.noscroll_cooldown
+.noscroll_timers
+.noscroll_disguise
+
+# macOS
+.DS_Store

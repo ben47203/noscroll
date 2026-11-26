@@ -9,10 +9,11 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shellcheck
         run: brew install shellcheck
       - name: Lint
         run: shellcheck noscroll install.sh uninstall.sh tests/run.sh
       - name: Test
+        timeout-minutes: 5
         run: ./tests/run.sh

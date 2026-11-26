@@ -392,8 +392,12 @@ verify_password() { verify_salted "$F_AUTH" "$1"; }
 verify_recovery() { verify_salted "$F_RECOVERY" "$(normalise_code "$1")"; }
 
 gen_recovery_code() {
-  local c
-  c=$(LC_ALL=C tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' < /dev/urandom | head -c 16)
+  local c=""
+  # Finite input: `tr < /dev/urandom | head` hangs where SIGPIPE is ignored.
+  while [ ${#c} -lt 16 ]; do
+    c="$c$(openssl rand -base64 96 | LC_ALL=C tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789')"
+  done
+  c=${c:0:16}
   printf '%s-%s-%s-%s\n' "${c:0:4}" "${c:4:4}" "${c:8:4}" "${c:12:4}"
 }
 

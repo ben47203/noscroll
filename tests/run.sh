@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2034  # globals are read by the sourced noscroll functions
+# shellcheck disable=SC2034,SC2153  # globals are read by the sourced noscroll functions
 # noscroll test suite — runs entirely in a temp sandbox; never touches your
 # real install, launchd, or browsers.
 #
@@ -255,6 +255,31 @@ migrate_config
 eq "delay → timer" "$(cfg timer)" 7200
 eq "recovery_delay → recover" "$(cfg recover)" 90000
 [ -f "$F_RECOVERY_OLD" ] && fail "old recovery code removed" || ok
+
+# Binary swapped or deleted → restored from the signed copy.
+chflags nouchg "$NOSCROLL_APP_DIR/noscroll"; printf '#!/bin/bash\nexit 0\n' > "$NOSCROLL_APP_DIR/noscroll"
+run status >/dev/null
+cmp -s "$NOSCROLL_APP_DIR/noscroll" "$NS" && ok || fail "swapped binary restored"
+chflags nouchg "$NOSCROLL_APP_DIR/noscroll"; rm -f "$NOSCROLL_APP_DIR/noscroll"
+run status >/dev/null
+cmp -s "$NOSCROLL_APP_DIR/noscroll" "$NS" && ok || fail "deleted binary restored"
+
+# Daemon memory guard: deleted state and re-signed forgeries are undone.
+(
+  NS_DAEMON=1; G_SECRET=""; G_SITES=""; G_CONFIG=""; G_AUTH=""; G_BINSUM=""
+  guard_state
+  before=$(sbody "$F_SITES")
+  chflags -R nouchg "$NOSCROLL_HOME"; rm -rf "$NOSCROLL_HOME"
+  guard_state
+  [ "$(sbody "$F_SITES")" = "$before" ] && sverify "$F_SITES" && sverify "$F_CONFIG" && echo DELETED_OK
+  # Forge: new secret, edited blocklist re-signed with it.
+  chflags nouchg "$F_SECRET"; chmod 600 "$F_SECRET"; openssl rand -hex 32 > "$F_SECRET"
+  printf 'nothing.example\n' | swrite "$F_SITES" protect
+  guard_state
+  [ "$(sbody "$F_SITES")" = "$before" ] && echo FORGED_OK
+) > "$SANDBOX/guard.out" 2>&1
+grep -q DELETED_OK "$SANDBOX/guard.out" && ok || fail "guard rebuilds a deleted state dir"
+grep -q FORGED_OK "$SANDBOX/guard.out" && ok || fail "guard undoes a re-signed forgery"
 
 # Usage file tamper → limits exhausted.
 RULE_COUNT=1; RULE_LIMIT[1]=600; RULE_KEY[1]=abc; USED[1]=0; USAGE_DATE=$(date +%F)

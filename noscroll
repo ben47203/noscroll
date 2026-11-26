@@ -49,13 +49,15 @@ F_STATE="$NS_HOME/state"
 F_LOG="$NS_HOME/log"
 F_STAGED="$NS_HOME/staged"
 F_RECOVERY_OLD="$NS_HOME/recovery"
+F_BINSUM="$NS_HOME/binsum"
 F_RULES_TSV="$NS_HOME/.rules"
 F_TABS="$NS_HOME/.tabs"
 D_BAK="$NS_HOME/.bak"
 D_LOCK="$NS_HOME/.lock"
+B_BIN="$D_BAK/noscroll.bin"
 
 # Files noscroll keeps immutable (chflags uchg) with a signed backup.
-NS_PROTECTED="$F_SITES $F_CONFIG $F_AUTH"
+NS_PROTECTED="$F_SITES $F_CONFIG $F_AUTH $F_BINSUM"
 
 NS_DEFAULT_SITES="instagram.com
 tiktok.com
@@ -311,6 +313,9 @@ ensure_home() {
   if [ ! -s "$F_SECRET" ]; then
     local had_state=0 f
     for f in $NS_PROTECTED; do [ -f "$f" ] && had_state=1; done
+    if [ "$had_state" = 1 ] && [ -z "$NS_DAEMON" ] && [ -z "$NOSCROLL_DRY" ] && is_loaded "$NS_LABEL"; then
+      die "noscroll's signing key is missing — the agent is restoring it. Try again in 30 seconds."
+    fi
     chflags nouchg "$F_SECRET" 2>/dev/null
     openssl rand -hex 32 > "$F_SECRET.tmp" && mv -f "$F_SECRET.tmp" "$F_SECRET"
     chmod 400 "$F_SECRET"
@@ -734,7 +739,9 @@ snapshot_tabs() {
       [ -n "$out" ] && printf '%s\n' "$out" | awk -v a="$name" 'NF { print a "\t" $0 }' >> "$F_TABS"
     else
       case "$out" in
-        *-1743*|*"Not authori"*) BROWSER_STATUS="$BROWSER_STATUS$name=denied;" ;;
+        *-1743*|*"Not authori"*)
+          BROWSER_STATUS="$BROWSER_STATUS$name=denied;"
+          [ "$(cfg strict)" = 1 ] && quit_app "$name" "it won't let noscroll control it (Automation is off)" ;;
         *) BROWSER_STATUS="$BROWSER_STATUS$name=error;" ;;
       esac
       browser_error "$name" "$out"
@@ -767,6 +774,17 @@ close_tabs() {   # reads CLOSE_SPECS: "app wid tab url" lines
     done < <(printf '%s' "$CLOSE_SPECS" | sort -t$'\t' -k1,1 -k2,2 -k3,3nr)
     [ -n "$list" ] && osascript -e "$(close_script "$app" "$list")" >/dev/null 2>>"$F_LOG"
   done < <(printf '%s' "$CLOSE_SPECS" | cut -f1 | sort -u)
+}
+
+quit_app() {   # NAME REASON
+  local pid comm
+  while read -r pid comm; do
+    case "$comm" in *.app/Contents/MacOS/"$1") ;; *) continue ;; esac
+    kill "$pid" 2>/dev/null && {
+      log "strict: quit $1 — $2"
+      notify "Strict mode closed $1: $2."
+    }
+  done < <(ps -axo pid=,comm= 2>/dev/null)
 }
 
 quit_unsupported() {
@@ -888,18 +906,32 @@ is_running() { is_loaded "$NS_LABEL"; }
 
 # Make sure everything that should be running is running. Called by the
 # CLI, the daemon and the watchdog, so each can resurrect the others.
+# Put back the installed binary if it was deleted or replaced.
+verify_binary() {
+  local want src=""
+  want=$(sbody "$F_BINSUM" | head -1)
+  [ -n "$want" ] || return 0
+  [ -f "$NS_BIN" ] && [ "$(sha256_file "$NS_BIN")" = "$want" ] && return 0
+  if [ -f "$B_BIN" ] && [ "$(sha256_file "$B_BIN")" = "$want" ]; then src="$B_BIN"
+  elif [ -n "$NS_SELF" ] && [ -f "$NS_SELF" ] && [ "$(sha256_file "$NS_SELF")" = "$want" ]; then src="$NS_SELF"
+  else log "tamper: binary changed and no matching copy to restore"; return 1
+  fi
+  mkdir -p "$NS_APP_DIR"
+  chflags nouchg "$NS_BIN" 2>/dev/null
+  cp "$src" "$NS_BIN" && chmod 755 "$NS_BIN" && chflags uchg "$NS_BIN" 2>/dev/null
+  log "tamper: restored $NS_BIN"
+  NS_TAMPERED="$NS_TAMPERED binary"
+}
+
 heal() {
   is_installed || return 0
+  verify_binary
   if [ -f "$F_STOPPED" ]; then
     is_stopped && return 0
     if ! sverify "$F_STOPPED"; then log "tamper: ignoring unsigned stop marker"; fi
     rm -f "$F_STOPPED"
   fi
-  if [ ! -f "$NS_BIN" ] && [ -n "$NS_SELF" ] && [ -f "$NS_SELF" ]; then
-    mkdir -p "$NS_APP_DIR"
-    cp "$NS_SELF" "$NS_BIN" && chmod 755 "$NS_BIN" && chflags uchg "$NS_BIN"
-    log "tamper: restored missing $NS_BIN"
-  fi
+  verify_binary
   [ -f "$NS_BIN" ] || return 1
   write_plists
   lctl enable "$NS_DOMAIN/$NS_LABEL"
@@ -932,12 +964,16 @@ do_uninstall() {
 }
 
 install_binary() {   # SRC
-  mkdir -p "$NS_APP_DIR"
+  mkdir -p "$NS_APP_DIR" "$D_BAK"
   if [ "$1" != "$NS_BIN" ]; then
     chflags nouchg "$NS_BIN" 2>/dev/null
     cp "$1" "$NS_BIN.tmp" && chmod 755 "$NS_BIN.tmp" && mv -f "$NS_BIN.tmp" "$NS_BIN"
   fi
   chflags uchg "$NS_BIN" 2>/dev/null
+  # Signed checksum + spare copy, so a swapped or deleted binary is restored.
+  chflags nouchg "$B_BIN" 2>/dev/null
+  cp "$NS_BIN" "$B_BIN" && chflags uchg "$B_BIN" 2>/dev/null
+  sha256_file "$NS_BIN" | swrite "$F_BINSUM" protect
   mkdir -p "$(dirname "$NS_LINK")"
   if [ -e "$NS_LINK" ] && [ ! -L "$NS_LINK" ]; then rm -f "$NS_LINK"; fi
   ln -sfn "$NS_BIN" "$NS_LINK"
@@ -1207,8 +1243,8 @@ tick() {
   [ "$dt" -gt $((NS_INTERVAL * 3)) ] && dt=$NS_INTERVAL
   [ "$dt" -lt 0 ] && dt=0
 
-  if [ $((TICK % 10)) -eq 0 ]; then
-    check_all_protected
+  if [ $((TICK % 5)) -eq 0 ]; then
+    guard_state
     rotate_log
     [ $((TICK % 15)) -eq 0 ] && heal
   fi
@@ -1273,6 +1309,34 @@ tick() {
 
   [ $((t - LAST_PERSIST)) -ge 10 ] && persist_usage
   write_state
+}
+
+# Daemon only: undo deletions/forgeries using the last good state it saw.
+# (A forged file re-signed with a regenerated secret fails once the
+# original secret is put back.)
+guard_file() {   # FILE VAR
+  if [ -f "$1" ] && sverify "$1"; then printf -v "$2" '%s' "$(sbody "$1")"; return 0; fi
+  local cached="${!2}"
+  [ -n "$cached" ] || return 0
+  printf '%s\n' "$cached" | swrite "$1" protect
+  log "tamper: rebuilt $(basename "$1") from memory"
+}
+
+guard_state() {
+  [ -d "$NS_HOME" ] || { mkdir -p "$NS_HOME" && chmod 700 "$NS_HOME"; }
+  [ -d "$D_BAK" ] || mkdir -p "$D_BAK"
+  if [ -n "$G_SECRET" ] && [ "$(cat "$F_SECRET" 2>/dev/null)" != "$G_SECRET" ]; then
+    chflags nouchg "$F_SECRET" 2>/dev/null
+    printf '%s\n' "$G_SECRET" > "$F_SECRET"; chmod 400 "$F_SECRET"; chflags uchg "$F_SECRET" 2>/dev/null
+    log "tamper: restored signing secret"
+  fi
+  ensure_home
+  [ -n "$G_SECRET" ] || G_SECRET=$(cat "$F_SECRET")
+  check_all_protected
+  guard_file "$F_SITES" G_SITES
+  guard_file "$F_CONFIG" G_CONFIG
+  guard_file "$F_AUTH" G_AUTH
+  guard_file "$F_BINSUM" G_BINSUM
 }
 
 run_watchdog() {

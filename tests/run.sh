@@ -297,5 +297,10 @@ while IFS='|' read -r name _ fam; do
   fi
 done <<< "$NS_BROWSERS"
 
+# The persistent JXA monitor runs and ends each check with a TICK line.
+MON_OUT=$(osascript -l JavaScript -e "$NS_MONITOR_JS" 0.01 2 "Nope|com.example.not-installed|safari" 2>&1)
+eq "monitor ticks" "$(printf '%s\n' "$MON_OUT" | grep -c '^TICK')" 2
+printf '%s\n' "$MON_OUT" | grep -q $'^TICK\t.*\t0$' && ok || fail "monitor: absent browser reported as not running ($MON_OUT)"
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "✓ $PASS passed"; else echo "✗ $FAIL failed, $PASS passed"; exit 1; fi

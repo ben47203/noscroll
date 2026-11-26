@@ -4,6 +4,24 @@ All notable changes to noscroll. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [semantic versioning](https://semver.org/).
 
+## [2.2.0] - 2026-11-27
+
+### Changed
+- **About 7× less CPU** (10.2% → ≈1.5% of one core, measured). A single
+  long-lived JavaScript-for-Automation monitor replaces starting `osascript`
+  every 2 seconds. It reads all of a browser's URLs in three Apple Events
+  instead of one per tab, and it checks adaptively: every interval while a
+  browser is in front, 4× less often otherwise, and immediately when you
+  switch to a browser.
+- Config is read with shell builtins, the matcher re-runs only when tabs
+  change, and full signature checks run only when a state file changes.
+
+### Added
+- `config interval <1–10s>`. Raising it is queued like any other loosening.
+
+### Fixed
+- The daemon silenced its own stderr after the first monitor restart.
+
 ## [2.1.0] - 2026-11-26
 
 ### Changed (breaking CLI)
@@ -61,6 +79,7 @@ uses [semantic versioning](https://semver.org/).
 - First release: Chrome and Safari tab blocker with a password, a
   10-minute cooldown and a disguised LaunchAgent.
 
+[2.2.0]: https://github.com/ben47203/noscroll/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ben47203/noscroll/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ben47203/noscroll/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/ben47203/noscroll/releases/tag/v1.0.0

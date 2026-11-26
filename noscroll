@@ -22,7 +22,7 @@
 #  "I just want to check <site> for five minutes" is not one of them.
 # ─────────────────────────────────────────────────────────────────────────
 
-NOSCROLL_VERSION="2.1.0"
+NOSCROLL_VERSION="2.2.0"
 
 # ───────────────────────────── paths ─────────────────────────────────────
 
@@ -333,6 +333,7 @@ ensure_home() {
 # ───────────────────────────── config ────────────────────────────────────
 
 cfg_raw() {
+  if [ -n "$NS_CFG_CACHED" ]; then local n="CFGV_$1"; printf '%s' "${!n}"; return 0; fi
   sbody "$F_CONFIG" | awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { printf "%s", v }'
 }
 
@@ -343,6 +344,7 @@ cfg_default() {
     timer|recover) echo 86400 ;;
     discreet|strict) echo 0 ;;
     notify) echo 1 ;;
+    interval) echo 2 ;;
   esac
 }
 
@@ -361,6 +363,21 @@ cfg_set() {
     body="$body"$'\n'"$k=$v"
   done
   printf '%s\n' "$body" | sed '/^$/d' | swrite "$F_CONFIG" protect
+  NS_CFG_CACHED=""
+}
+
+# Daemon: load config once per tick with shell builtins (no processes).
+load_cfg_cache() {
+  local k v
+  CFGV_mode=""; CFGV_cooldown=""; CFGV_timer=""; CFGV_recover=""; CFGV_discreet=""; CFGV_strict=""; CFGV_notify=""; CFGV_interval=""
+  if [ -f "$F_CONFIG" ]; then
+    while IFS='=' read -r k v; do
+      case "$k" in mode|cooldown|timer|recover|discreet|strict|notify|interval) printf -v "CFGV_$k" '%s' "$v" ;; esac
+    done < "$F_CONFIG"
+  fi
+  : "${CFGV_mode:=password}" "${CFGV_cooldown:=600}" "${CFGV_timer:=86400}" "${CFGV_recover:=86400}"
+  : "${CFGV_discreet:=0}" "${CFGV_strict:=0}" "${CFGV_notify:=1}" "${CFGV_interval:=2}"
+  NS_CFG_CACHED=1
 }
 
 # v2.0 used one "delay" (meaning cooldown or timer by mode) and
@@ -658,8 +675,10 @@ match_url() {
 # (v1 compiled Chrome and Safari into one script — once Chrome was
 # uninstalled the whole script failed to compile and Safari went unblocked.)
 
+# One Apple Event per window for all its URLs (not one per tab): this is
+# most of the cost of a check, and it's paid by the browser, not noscroll.
 dump_script() {   # NAME DIALECT
-  local active
+  local active n; n=$(as_escape "$1")
   case "$2" in
     safari)   active='set cur to index of current tab of w' ;;
     arc)      active='set cur to -1
@@ -671,30 +690,140 @@ dump_script() {   # NAME DIALECT
   cat <<EOF
 set TB to character id 9
 set out to ""
-tell application "$1"
+tell application "$n"
   repeat with w in windows
     try
       set wid to id of w
       set curURL to ""
+      set urls to URL of every tab of w
       $active
-      set ti to 0
-      repeat with t in tabs of w
-        set ti to ti + 1
-        set u to ""
-        try
-          set u to URL of t
-        end try
+      repeat with ti from 1 to count of urls
+        set u to item ti of urls
         if u is missing value then set u to ""
         set isActive to 0
         if ti = cur then set isActive to 1
         if cur = -1 and u = curURL and u is not "" then set isActive to 1
-        set out to out & (wid as text) & TB & ti & TB & isActive & TB & (u as text) & linefeed
+        set out to out & "$n" & TB & (wid as text) & TB & ti & TB & isActive & TB & (u as text) & linefeed
       end repeat
     end try
   end repeat
 end tell
 return out
 EOF
+}
+
+# The monitor: one long-lived JavaScript-for-Automation process that polls
+# every running supported browser and streams tab blocks to the daemon.
+# Starting osascript costs ~65 ms of CPU, so doing it every 2 s dominated
+# battery use; this way it starts once per 300 checks. JXA resolves apps at
+# run time, so a missing browser can't break the script (the v1 bug), and
+# it fetches every window's URLs in three Apple Events per browser.
+#
+# Output per check: "app wid tab active url" lines, "OK<TAB>app" or
+# "ERR<TAB>app<TAB>message", then "TICK<TAB>frontmost-bundle-id<TAB>any".
+read -r -d '' NS_MONITOR_JS <<'JS'
+function run(argv) {
+  ObjC.import('AppKit');
+  var interval = parseFloat(argv[0]) || 2, iters = parseInt(argv[1], 10) || 300;
+  var specs = (argv[2] || '').split('\n').filter(Boolean).map(function (l) {
+    var p = l.split('|'); return { name: p[0], bid: p[1], fam: p[2] };
+  });
+  var isBrowser = {}; specs.forEach(function (sp) { isBrowser[sp.bid] = true; });
+  var out = $.NSFileHandle.fileHandleWithStandardOutput, ws = $.NSWorkspace.sharedWorkspace;
+  function emit(s) { out.writeData($(s + '\n').dataUsingEncoding($.NSUTF8StringEncoding)); }
+  function front() {
+    var f = ws.frontmostApplication;
+    if (f && !f.isNil() && f.bundleIdentifier && !f.bundleIdentifier.isNil()) return ObjC.unwrap(f.bundleIdentifier);
+    return '';
+  }
+  function check(fb) {
+    var lines = [], any = 0;
+    specs.forEach(function (sp) {
+      // .count is bridged as a string: compare numerically.
+      if (Number($.NSRunningApplication.runningApplicationsWithBundleIdentifier(sp.bid).count) === 0) return;
+      any = 1;
+      try {
+        var app = Application(sp.bid);
+        if (!app.running()) return;
+        var W = app.windows, wids = W.id(), urlss = W.tabs.url(), curs = [], curURLs = [];
+        try {
+          if (sp.fam === 'safari') curs = W.currentTab.index();
+          else if (sp.fam === 'arc') curURLs = W.activeTab.url();
+          else curs = W.activeTabIndex();
+        } catch (e) {}
+        for (var k = 0; k < wids.length; k++) {
+          var urls = urlss[k] || [], cur = (curs[k] === undefined || curs[k] === null) ? -1 : curs[k];
+          var curURL = curURLs[k] || '';
+          for (var t = 0; t < urls.length; t++) {
+            var u = urls[t] || '';
+            var act = ((t + 1) === cur || (cur === -1 && u && u === curURL)) ? 1 : 0;
+            lines.push(sp.name + '\t' + wids[k] + '\t' + (t + 1) + '\t' + act + '\t' + u);
+          }
+        }
+        lines.push('OK\t' + sp.name);
+      } catch (e) {
+        lines.push('ERR\t' + sp.name + '\t' + String(e).replace(/\s+/g, ' '));
+      }
+    });
+    lines.push('TICK\t' + fb + '\t' + any);
+    emit(lines.join('\n'));
+  }
+  // Glance at the frontmost app twice a second (nearly free). Do a full
+  // check every interval while a browser is in front, every 4× interval
+  // otherwise, and straight away when you switch to a browser.
+  var last = -1e9, lastFront = null, done = 0;
+  while (done < iters) {
+    var fb = front(), now = Date.now() / 1000, due = isBrowser[fb] ? interval : interval * 4;
+    if (fb !== lastFront && isBrowser[fb]) due = 0;
+    lastFront = fb;
+    if (now - last >= due) { check(fb); last = now; done++; }
+    if (done < iters) delay(Math.min(0.5, interval));
+  }
+}
+JS
+
+MON_PID=""
+monitor_stop() {
+  [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null
+  MON_PID=""
+  exec 4<&-   # (no 2>/dev/null here: exec redirections stick to the shell)
+}
+
+monitor_start() {
+  monitor_stop
+  MON_FIFO="$NS_HOME/.monitor"
+  rm -f "$MON_FIFO"
+  mkfifo -m 600 "$MON_FIFO" || return 1
+  osascript -l JavaScript -e "$NS_MONITOR_JS" "$NS_INTERVAL" 300 "$NS_BROWSERS" > "$MON_FIFO" 2>>"$F_LOG" &
+  MON_PID=$!
+  exec 4<"$MON_FIFO"
+}
+
+# Read one check from the monitor. Sets TABS, BROWSER_STATUS, MON_FRONT,
+# NS_ANY_BROWSER. Fails on timeout or when the monitor exits.
+monitor_read() {
+  local line name
+  TABS=""; BROWSER_STATUS=""
+  while :; do
+    IFS= read -r -t $((NS_INTERVAL * 4 + 25)) line <&4 || return 1
+    case "$line" in
+      TICK$'\t'*)
+        line=${line#TICK$'\t'}
+        MON_FRONT=${line%%$'\t'*}; NS_ANY_BROWSER=${line##*$'\t'}
+        return 0 ;;
+      OK$'\t'*) BROWSER_STATUS="$BROWSER_STATUS${line#OK$'\t'}=ok;" ;;
+      ERR$'\t'*)
+        line=${line#ERR$'\t'}; name=${line%%$'\t'*}
+        case "$line" in
+          *-1743*|*"Not authori"*|*"not allowed"*)
+            BROWSER_STATUS="$BROWSER_STATUS$name=denied;"
+            if [ "$CFGV_strict" = 1 ]; then scan_apps; quit_app "$name" "it won't let noscroll control it (Automation is off)"; fi ;;
+          *) BROWSER_STATUS="$BROWSER_STATUS$name=error;" ;;
+        esac
+        browser_error "$name" "${line#*$'\t'}" ;;
+      *) TABS="$TABS$line"$'\n' ;;
+    esac
+  done
 }
 
 close_script() {  # NAME SPECS   (specs: {{wid, tab, "url"}, …})
@@ -716,27 +845,47 @@ end tell
 EOF
 }
 
-running_apps() { ps -axo comm= 2>/dev/null | awk -F/ '/\.app\/Contents\/MacOS\//{print $NF}' | sort -u; }
+# One pgrep for every browser we know (supported or not). Main executables
+# only: "Google Chrome Helper (Renderer)" must not count as Chrome.
+NS_APP_RE="\.app/Contents/MacOS/($(printf '%s\n' "$NS_BROWSERS" | cut -d'|' -f1 | cat - <(printf '%s\n' "$NS_UNSUPPORTED") | paste -sd'|' -))( -|\$)"
 
-front_bundle() { lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null | sed -n 's/.*bundleID="\([^"]*\)".*/\1/p' | head -1; }
-
-browser_field() {  # NAME FIELD(2=bundle,3=dialect)
-  printf '%s\n' "$NS_BROWSERS" | awk -F'|' -v n="$1" -v f="$2" '$1 == n { print $f; exit }'
+scan_apps() {   # sets APPS: "pid<TAB>name" lines
+  local pid path
+  APPS=""
+  while read -r pid path; do
+    path="${path##*/Contents/MacOS/}"
+    APPS="$APPS$pid"$'\t'"${path%% -*}"$'\n'
+  done < <(pgrep -lf "$NS_APP_RE" 2>/dev/null)
 }
 
-# Writes "app wid tab active url" lines for every tab of every running
-# supported browser. Records per-browser errors in BROWSER_ERRORS.
+app_running() { case $'\n'"$APPS" in *$'\t'"$1"$'\n'*) return 0 ;; esac; return 1; }
+
+running_apps() { scan_apps; printf '%s' "$APPS" | cut -f2 | sort -u; }
+
+front_app_name() {   # name of the frontmost app if it's a supported browser
+  local bid name b
+  bid=$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)
+  bid=${bid#*bundleID=\"}; bid=${bid%%\"*}
+  while IFS='|' read -r name b _; do
+    [ "$b" = "$bid" ] && { printf '%s' "$name"; return 0; }
+  done <<< "$NS_BROWSERS"
+}
+
+# Appends "app wid tab active url" lines for every tab of every running
+# supported browser to F_TABS. Records per-browser state in BROWSER_STATUS.
 snapshot_tabs() {
-  local name fam out running
-  running="$(running_apps)"
-  BROWSER_STATUS=""
+  local name fam out i=0
+  BROWSER_STATUS=""; NS_ANY_BROWSER=0
   : > "$F_TABS"
   while IFS='|' read -r name _ fam; do
+    i=$((i + 1))
     [ -z "$name" ] && continue
-    printf '%s\n' "$running" | grep -qxF "$name" || continue
-    if out=$(osascript -e "$(dump_script "$name" "$fam")" 2>&1); then
+    app_running "$name" || continue
+    NS_ANY_BROWSER=1
+    [ -n "${DUMP_CACHE[i]}" ] || DUMP_CACHE[i]=$(dump_script "$name" "$fam")
+    if out=$(osascript -e "${DUMP_CACHE[i]}" 2>&1); then
       BROWSER_STATUS="$BROWSER_STATUS$name=ok;"
-      [ -n "$out" ] && printf '%s\n' "$out" | awk -v a="$name" 'NF { print a "\t" $0 }' >> "$F_TABS"
+      [ -n "$out" ] && printf '%s\n' "$out" >> "$F_TABS"
     else
       case "$out" in
         *-1743*|*"Not authori"*)
@@ -776,29 +925,29 @@ close_tabs() {   # reads CLOSE_SPECS: "app wid tab url" lines
   done < <(printf '%s' "$CLOSE_SPECS" | cut -f1 | sort -u)
 }
 
-quit_app() {   # NAME REASON
-  local pid comm
-  while read -r pid comm; do
-    case "$comm" in *.app/Contents/MacOS/"$1") ;; *) continue ;; esac
+quit_app() {   # NAME REASON   (uses APPS from scan_apps)
+  local pid name
+  while IFS=$'\t' read -r pid name; do
+    [ "$name" = "$1" ] || continue
     kill "$pid" 2>/dev/null && {
       log "strict: quit $1 — $2"
       notify "Strict mode closed $1: $2."
     }
-  done < <(ps -axo pid=,comm= 2>/dev/null)
+  done <<< "$APPS"
 }
 
 quit_unsupported() {
-  local pid comm name
-  while read -r pid comm; do
-    name="${comm##*/}"
-    case "$comm" in *.app/Contents/MacOS/*) ;; *) continue ;; esac
-    if printf '%s\n' "$NS_UNSUPPORTED" | grep -qxF "$name"; then
-      kill "$pid" 2>/dev/null && {
-        log "strict: quit unsupported browser $name"
-        notify "Strict mode: $name can't be monitored, so it was closed."
-      }
-    fi
-  done < <(ps -axo pid=,comm= 2>/dev/null)
+  local pid name
+  while IFS=$'\t' read -r pid name; do
+    [ -z "$name" ] && continue
+    case $'\n'"$NS_UNSUPPORTED"$'\n' in
+      *$'\n'"$name"$'\n'*)
+        kill "$pid" 2>/dev/null && {
+          log "strict: quit unsupported browser $name"
+          notify "Strict mode: $name can't be monitored, so it was closed."
+        } ;;
+    esac
+  done <<< "$APPS"
 }
 
 LAST_NOTIFY=0
@@ -1154,6 +1303,8 @@ run_daemon() {
 }
 
 daemon_cleanup() {
+  monitor_stop
+  rm -f "$NS_HOME/.monitor"
   persist_usage
   [[ "$NS_SELF" == /tmp/* ]] && rm -f "$NS_SELF"
   rm -f "$F_TABS" "$F_RULES_TSV"
@@ -1167,13 +1318,43 @@ daemon_loop() {
   trap 'exit 0' TERM INT HUP
   ensure_home
   log "daemon: start v$NOSCROLL_VERSION pid $$"
-  RULES_SIG=""; TICK=0; LAST_TICK=$(now); USAGE_DATE=""; LAST_PERSIST=0; RULE_COUNT=0
+  RULES_SIG=""; TICK=0; USAGE_DATE=""; LAST_PERSIST=0; RULE_COUNT=0
+  LAST_FP=""; USAGE_DIRTY=0; NS_ANY_BROWSER=0; LAST_TABS="-"; MATCH_OUT=""
+  clock_sync; LAST_TICK=$NOW
+  local fails=0 fallback_until=0
+  [ -n "$NOSCROLL_INTERVAL" ] || NS_INTERVAL=$(cfg interval)
   while :; do
+    if [ "$NOW" -lt "$fallback_until" ]; then
+      NS_MON=0
+    elif [ -z "$MON_PID" ] && ! monitor_start; then
+      NS_MON=0
+    elif monitor_read; then
+      NS_MON=1; fails=0
+    else
+      monitor_stop
+      fails=$((fails + 1))
+      # Exits after its 300 checks are normal; repeated failures aren't.
+      if [ "$fails" -ge 5 ]; then
+        log "daemon: monitor keeps failing — polling directly for 10 minutes"
+        fallback_until=$((NOW + 600)); fails=0
+      fi
+      continue
+    fi
     tick
     [ -n "$NS_RESTART" ] && { log "daemon: restarting for upgrade"; exit 0; }
     TICK=$((TICK + 1))
-    sleep "$NS_INTERVAL"
+    if [ "$NS_MON" = 0 ]; then
+      if [ "$NS_ANY_BROWSER" = 1 ]; then sleep "$NS_INTERVAL"; else sleep $((NS_INTERVAL * 2)); fi
+    fi
   done
+}
+
+# Wall-clock seconds without spawning `date` every tick.
+clock_sync() {
+  local d; d=$(date '+%s %F')
+  NS_T0=$(( ${d%% *} - SECONDS )); TODAY=${d#* }
+  NEXT_MIDNIGHT=$(date -j -v+1d -v0H -v0M -v0S '+%s' 2>/dev/null || echo $(( ${d%% *} + 3600 )))
+  NOW=${d%% *}
 }
 
 maybe_reload_rules() {
@@ -1193,7 +1374,7 @@ maybe_reload_rules() {
     FIRST_SEEN[i]=0; USED[i]=0; WARNED[i]=0
   done < <(rules_body)
   write_rules_tsv "$F_RULES_TSV"
-  USAGE_DATE=""
+  USAGE_DATE=""; LAST_TABS="-"
 }
 
 load_usage() {   # DATE
@@ -1222,13 +1403,16 @@ persist_usage() {
   for ((i = 1; i <= RULE_COUNT; i++)); do
     [ "${RULE_LIMIT[i]:-0}" -gt 0 ] && printf '%s %s %s\n' "$USAGE_DATE" "${RULE_KEY[i]}" "${USED[i]:-0}"
   done | swrite "$F_USAGE"
-  LAST_PERSIST=$(now)
+  LAST_PERSIST=$(now); USAGE_DIRTY=0
 }
 
-write_state() {
-  {
-    printf 'pid=%s\nversion=%s\nheartbeat=%s\nbrowsers=%s\n' "$$" "$NOSCROLL_VERSION" "$(now)" "$BROWSER_STATUS"
-  } > "$F_STATE.tmp" && mv -f "$F_STATE.tmp" "$F_STATE"
+write_state() {   # [EPOCH]
+  printf 'pid=%s\nversion=%s\nheartbeat=%s\nbrowsers=%s\n' "$$" "$NOSCROLL_VERSION" "${1:-$(now)}" "$BROWSER_STATUS" > "$F_STATE" 2>/dev/null
+}
+
+# Cheap change detector for the files guard_state protects.
+state_fingerprint() {
+  stat -f '%N %m %z %i' "$F_SECRET" "$F_SITES" "$F_CONFIG" "$F_AUTH" "$F_BINSUM" "$D_BAK"/* 2>&1
 }
 
 queue_close() {   # APP WID TAB URL IDX
@@ -1237,30 +1421,53 @@ queue_close() {   # APP WID TAB URL IDX
 }
 
 tick() {
-  local t dt i idx app wid ti act url front_app=""
-  t=$(now); dt=$((t - LAST_TICK)); LAST_TICK=$t
+  local t today dt i idx app wid ti act url front_app="" front_done=0 fp
+  NOW=$((NS_T0 + SECONDS))
+  if [ "$NOW" -ge "$NEXT_MIDNIGHT" ] || [ $((TICK % 300)) -eq 0 ]; then clock_sync; fi
+  t=$NOW; today=$TODAY
+  dt=$((t - LAST_TICK)); LAST_TICK=$t
   # Don't count time across sleep/suspend.
   [ "$dt" -gt $((NS_INTERVAL * 3)) ] && dt=$NS_INTERVAL
   [ "$dt" -lt 0 ] && dt=0
 
-  if [ $((TICK % 5)) -eq 0 ]; then
+  # Full signature checks only when something changed (or every ~5 min).
+  fp=$(state_fingerprint)
+  if [ "$fp" != "$LAST_FP" ] || [ $((TICK % 150)) -eq 0 ]; then
     guard_state
-    rotate_log
-    [ $((TICK % 15)) -eq 0 ] && heal
+    maybe_reload_rules
+    LAST_FP=$(state_fingerprint)
   fi
+  load_cfg_cache
+  if [ -z "$NOSCROLL_INTERVAL" ] && [ "$CFGV_interval" != "$NS_INTERVAL" ]; then
+    NS_INTERVAL=$CFGV_interval; monitor_stop   # restarts at the new rate
+  fi
+  if [ "$CFGV_strict" = 1 ] && [ $((TICK % 5)) -eq 0 ]; then scan_apps; quit_unsupported; fi
+  if [ $((TICK % 30)) -eq 0 ]; then heal; rotate_log; fi
   process_pending
   [ -n "$NS_RESTART" ] && return 0
-  maybe_reload_rules
-  local today; today=$(date +%F)
   [ "$today" != "$USAGE_DATE" ] && load_usage "$today"
 
-  [ "$(cfg strict)" = 1 ] && quit_unsupported
+  if [ "$RULE_COUNT" -eq 0 ]; then write_state "$t"; return 0; fi
 
-  if [ "$RULE_COUNT" -eq 0 ]; then BROWSER_STATUS=""; write_state; return 0; fi
+  if [ "$NS_MON" = 1 ]; then
+    if [ -n "$MON_FRONT" ]; then
+      local n b
+      while IFS='|' read -r n b _; do [ "$b" = "$MON_FRONT" ] && front_app=$n; done <<< "$NS_BROWSERS"
+    fi
+    front_done=1
+  else
+    scan_apps
+    snapshot_tabs
+    TABS=$(cat "$F_TABS")
+  fi
+  [ "$NS_ANY_BROWSER" = 1 ] || { write_state "$t"; return 0; }
 
-  snapshot_tabs
-  local fb; fb=$(front_bundle)
-  [ -n "$fb" ] && front_app=$(printf '%s\n' "$NS_BROWSERS" | awk -F'|' -v b="$fb" '$2 == b { print $1; exit }')
+  # Tabs rarely change between checks: only re-run the matcher when they do.
+  if [ "$TABS" != "$LAST_TABS" ]; then
+    printf '%s' "$TABS" > "$F_TABS"
+    MATCH_OUT=$(awk "$NS_MATCHER" "$F_RULES_TSV" "$F_TABS")
+    LAST_TABS=$TABS
+  fi
 
   for ((i = 1; i <= RULE_COUNT; i++)); do R_SEEN[i]=0; R_ACTIVE[i]=0; done
   CLOSE_SPECS=""; CLOSED_LABEL=""
@@ -1269,8 +1476,9 @@ tick() {
     if [ "${RULE_LIMIT[idx]}" -gt 0 ]; then
       if [ "${USED[idx]}" -ge "${RULE_LIMIT[idx]}" ]; then
         queue_close "$app" "$wid" "$ti" "$url" "$idx"
-      elif [ "$act" = 1 ] && [ "$app" = "$front_app" ]; then
-        R_ACTIVE[idx]=1
+      elif [ "$act" = 1 ]; then
+        [ "$front_done" = 1 ] || { front_app=$(front_app_name); front_done=1; }
+        [ "$app" = "$front_app" ] && R_ACTIVE[idx]=1
       fi
     elif [ "${RULE_GRACE[idx]}" -gt 0 ]; then
       R_SEEN[idx]=1
@@ -1282,13 +1490,13 @@ tick() {
     else
       queue_close "$app" "$wid" "$ti" "$url" "$idx"
     fi
-  done < <(awk "$NS_MATCHER" "$F_RULES_TSV" "$F_TABS")
+  done <<< "$MATCH_OUT"
 
   local left
   for ((i = 1; i <= RULE_COUNT; i++)); do
     [ "${R_SEEN[i]}" = 0 ] && FIRST_SEEN[i]=0
     [ "${R_ACTIVE[i]}" = 1 ] || continue
-    USED[i]=$(( USED[i] + dt ))
+    USED[i]=$(( USED[i] + dt )); USAGE_DIRTY=1
     left=$(( RULE_LIMIT[i] - USED[i] ))
     if [ "$left" -le 0 ] && [ "${WARNED[i]}" -lt 3 ]; then
       WARNED[i]=3; notify "Time's up for ${RULE_LABEL[i]} today."
@@ -1300,15 +1508,15 @@ tick() {
   done
 
   if [ -n "$CLOSE_SPECS" ]; then
-    close_tabs
+    close_tabs; LAST_TABS="-"
     if [ $((t - LAST_NOTIFY)) -ge 30 ]; then
       LAST_NOTIFY=$t
-      if [ "$(cfg discreet)" = 1 ]; then notify "Closed a blocked tab."; else notify "Closed $CLOSED_LABEL."; fi
+      if [ "$CFGV_discreet" = 1 ]; then notify "Closed a blocked tab."; else notify "Closed $CLOSED_LABEL."; fi
     fi
   fi
 
-  [ $((t - LAST_PERSIST)) -ge 10 ] && persist_usage
-  write_state
+  [ "$USAGE_DIRTY" = 1 ] && [ $((t - LAST_PERSIST)) -ge 10 ] && persist_usage
+  write_state "$t"
 }
 
 # Daemon only: undo deletions/forgeries using the last good state it saw.
@@ -1764,6 +1972,7 @@ cmd_config() {
     info "discreet  $(onoff discreet)   store every new site hex-encoded and hidden"
     info "strict    $(onoff strict)   quit browsers noscroll can't monitor or control"
     info "notify    $(onoff notify)   macOS notifications"
+    info "interval  $(cfg interval)s     how often an open browser is checked (1–10s)"
     return 0
   fi
   local key="$1" val="$2" b s
@@ -1783,6 +1992,11 @@ cmd_config() {
       [ -n "$b" ] || die "usage: noscroll config strict on|off"
       if [ "$b" = 1 ]; then cfg_set "strict=1"; info "Strict mode on."
       else authorise "turn off strict mode"; queue_action config "strict=0" "Turn off strict mode"; fi ;;
+    interval)
+      s=$(parse_duration "$val") || die "usage: noscroll config interval <1–10s>"
+      [ "$s" -ge 1 ] && [ "$s" -le 10 ] || die "interval must be between 1s and 10s."
+      if [ "$s" -le "$(cfg interval)" ]; then cfg_set "interval=$s"; info "interval: ${s}s"
+      else authorise "check less often"; queue_action config "interval=$s" "Check browsers every ${s}s"; fi ;;
     mode) die "use: noscroll mode password|timer" ;;
     *) die "unknown setting '$key' (see: noscroll config)" ;;
   esac
@@ -1974,7 +2188,7 @@ CONTROL
   start                         Start again after a stop
   pending | cancel [id|all]     Show / cancel queued changes (no password)
   mode password|timer           Password + cooldown, or no password + timer
-  config [key value]            cooldown · timer · recover · discreet · strict · notify
+  config [key value]            cooldown · timer · recover · interval · discreet · strict · notify
 
 SETUP
   install | uninstall           Install agent + watchdog / remove everything

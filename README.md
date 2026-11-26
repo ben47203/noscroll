@@ -22,8 +22,8 @@ a 10-minute cooldown, or no password and a 24-hour delay. Changes that
 *tighten* it apply straight away.
 
 It's one dependency-free bash script. It watches Safari and Chromium-based
-browsers, closes matching tabs within about two seconds, and restarts itself if
-it's killed.
+browsers, closes matching tabs within about two seconds of you looking at them,
+and restarts itself if it's killed.
 
 ```console
 $ noscroll block reddit.com instagram.com
@@ -61,6 +61,10 @@ Takes effect in 10m (Thu 26 Nov 13:10). Changed your mind? noscroll cancel 1
   - A swapped or deleted binary is put back.
   - Any `noscroll` command repairs a broken install.
   - Upgrades go through the same queue.
+- 🔋 **Light on battery.** One long-lived monitor checks the browser in front
+  every 2s, and the ones in the background every 8s. Switching to a browser
+  triggers a check at once. It measures about 1–1.5% of one CPU core (see
+  [FAQ](#faq)).
 - 🌐 **Multi-browser.** Safari, Safari Technology Preview, Chrome
   (incl. Beta/Dev/Canary), Chromium, Brave, Edge, Vivaldi and Arc. Strict mode
   quits browsers it can't monitor, such as Firefox.
@@ -240,6 +244,7 @@ noscroll config cooldown|timer|recover <time>
 noscroll config discreet on|off        # hex-encode and mask every rule
 noscroll config strict on|off          # quit browsers noscroll can't monitor or control
 noscroll config notify on|off          # macOS notifications
+noscroll config interval 3s            # check the front browser every 1–10s (default 2s)
 ```
 
 Run `noscroll help` for the full command list, and `noscroll doctor` when
@@ -249,12 +254,16 @@ something looks wrong.
 
 ```
  launchd (your user)
- ├── com.noscroll.agent            KeepAlive · every 2 s
- │     1. apply queued changes whose delay has passed
- │     2. ask each running browser for its tabs   (AppleScript, one per browser)
- │     3. match every URL against your rules      (awk)
- │     4. close matches, count time on limited sites
- │     5. restart the watchdog if it's gone
+ ├── com.noscroll.agent            KeepAlive
+ │     ├── monitor (one long-lived osascript, JavaScript)
+ │     │     glance at the frontmost app every 0.5 s; read every tab of each
+ │     │     running browser: every 2 s if a browser is in front, every 8 s if
+ │     │     not, immediately when you switch to one
+ │     └── for each check:
+ │           1. apply queued changes whose delay has passed
+ │           2. match every URL against your rules     (awk, only if tabs changed)
+ │           3. close matches, count time on limited sites
+ │           4. restart the watchdog if it's gone
  │
  └── com.noscroll.agent.watchdog   every 30 s
        restart / re-enable the agent unless a legitimate stop is in force
@@ -265,7 +274,8 @@ something looks wrong.
 ```
 
 - **Browsers are checked one at a time.** A browser that's missing, crashed or
-  not yet permitted can't stop the others from being checked.
+  not yet permitted can't stop the others from being checked. If the monitor
+  keeps failing, the agent falls back to direct polling for 10 minutes.
 - **The queue is signed.** A hand-edited or back-dated request is thrown away,
   not obeyed.
 - **The blocklist and settings are immutable** (`chflags uchg`) and signed. If
@@ -370,6 +380,18 @@ become `~keyword` rules and keep working as before.
 
 **Why bash?** It ships with every Mac, there's nothing to compile or install,
 and the whole program is one file you can read before you trust it.
+
+**How much battery does it use?** Measured on an Apple Silicon Mac with
+Safari open (9 tabs), over two minutes including start-up:
+
+| Version | CPU (share of one core) |
+| --- | --- |
+| 2.1 (started `osascript` every 2 s, one Apple Event per tab) | 10.2% |
+| 2.2 (persistent monitor, bulk reads, adaptive rate) | ≈1–1.5% |
+
+Safari also does work answering each check: about 7ms per check now, against
+43ms before. Most of the remaining cost is talking to the browser, so
+`config interval 4s` roughly halves it, at the price of a slower close.
 
 **Does it phone home?** No. It makes no network requests at all. Your blocklist
 never leaves your machine.

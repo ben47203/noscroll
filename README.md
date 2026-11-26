@@ -26,15 +26,15 @@ browsers, closes matching tabs within about two seconds, and restarts itself if
 it's killed.
 
 ```console
-$ noscroll add reddit.com instagram.com
+$ noscroll block reddit.com instagram.com
 Blocked reddit.com.
 Blocked instagram.com.
 
 $ noscroll limit youtube.com 30m
-Blocked youtube.com (30m/day).
+Limited youtube.com to 30m/day.
 
-$ noscroll remove reddit.com
-Password (or recovery code) to unblock:
+$ noscroll unblock reddit.com
+Password to unblock:
 Queued #1: Unblock reddit.com
 Takes effect in 10m (Thu 26 Nov 13:10). Changed your mind? noscroll cancel 1
 ```
@@ -49,14 +49,16 @@ Takes effect in 10m (Thu 26 Nov 13:10). Changed your mind? noscroll cancel 1
 - 🔐 **Two unlock modes.** *Password* mode needs your password plus a cooldown.
   *Timer* mode has no password at all, just a long wait. A password is only as
   strong as your willpower to forget it, so timer mode skips it.
-- 🆘 **Built-in recovery.** You get a recovery code, and `noscroll forgot` gives
-  you the machine back after 24 hours, with no password needed.
-- 🕶️ **Discreet mode.** Rules can be stored hex-encoded and masked in `list`, so
-  the names of the sites you block don't sit in plain text or in your shell
-  history.
+- 🆘 **A way back.** Forget your password and `noscroll forgot` gives you the
+  machine back after a wait you choose (24 hours by default), with no password.
+- 🕶️ **Discreet mode.** Prefix any command with `hex` and give the site
+  hex-encoded. The names of the sites you block then never sit in plain text,
+  in `list` or in your shell history.
 - 🛡️ **Hard to break.**
   - A watchdog agent and the main agent restart each other.
-  - State files are signed, made immutable and restored automatically if edited.
+  - State files are signed, made immutable and restored automatically if edited
+    or deleted, even if the signing key is replaced.
+  - A swapped or deleted binary is put back.
   - Any `noscroll` command repairs a broken install.
   - Upgrades go through the same queue.
 - 🌐 **Multi-browser.** Safari, Safari Technology Preview, Chrome
@@ -83,8 +85,7 @@ cd noscroll
 The installer:
 
 1. asks how unlocking should work (**password** or **timer**, see [Unlock modes](#unlock-modes))
-2. sets your password and prints a **recovery code**. Store it somewhere you
-   can't reach on impulse; giving it to a friend works well.
+2. sets your password (password mode only)
 3. copies noscroll to `~/Library/Application Support/noscroll/` and links it as
    `~/.local/bin/noscroll`
 4. starts the login agent and its watchdog
@@ -103,52 +104,64 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Quick start
 
 ```sh
-noscroll status                      # is it running? what's pending?
-noscroll add reddit.com              # block a site and all its subdomains
-noscroll add linkedin.com/feed       # block just the feed, not the rest of LinkedIn
-noscroll limit youtube.com 45m       # 45 minutes a day
-noscroll allow reddit.com/r/swift    # an exception (queued, because it loosens)
-noscroll list                        # see your rules
+noscroll status                       # is it running? what's pending?
+noscroll block reddit.com             # block a site and all its subdomains
+noscroll block linkedin.com/feed      # block just the feed, not the rest of LinkedIn
+noscroll limit youtube.com 45m        # 45 minutes a day
+noscroll allow reddit.com/r/swift     # an exception (queued, because it loosens)
+noscroll list                         # see your rules
 noscroll check https://old.reddit.com/r/pics   # "would this be closed?"
 ```
 
 ## Guide
 
-### Blocking sites
+### Commands at a glance
 
-| Pattern | Blocks |
+Every restriction has an obvious inverse. Adding or tightening a restriction is
+instant. Removing or loosening one goes through the [queue](#unlock-modes).
+
+| Add | Remove | What it does |
+| --- | --- | --- |
+| `block <site>…` | `unblock <site>…` *(queued)* | close the site on sight |
+| `limit <site>… <time>` | `unlimit <site>…` *(queued)* | allow this much time per day |
+| `allow <site>…` *(queued)* | `disallow <site>…` | an exception that beats any rule |
+
+Any of these also accepts `'#n'` (a number from `noscroll list`) in place of a
+site. `unblock` only removes blocks and `unlimit` only removes limits. If you
+use the wrong one, noscroll tells you which you need.
+
+### Patterns
+
+| Pattern | Matches |
 | --- | --- |
 | `reddit.com` | `reddit.com` and every subdomain (`www.`, `old.`, `m.`, …) |
 | `reddit.com/r/all` | that path and anything below it, on any subdomain |
 | `*.example.com` | subdomains only, not `example.com` itself |
 | `=m.example.com` | exactly that host, nothing else |
 | `~casino` | any URL containing the keyword |
-| `!reddit.com/r/swift` | *exception*: never closed, even if a block rule matches |
 
-When you add a pattern, noscroll lower-cases it and strips the scheme, `www.`
-and trailing slashes, so pasting a URL works: `noscroll add https://www.tiktok.com/`.
+noscroll lower-cases patterns and strips the scheme, `www.` and trailing
+slashes, so pasting a URL works: `noscroll block https://www.tiktok.com/`.
 
 ```sh
-noscroll add <site>…                    # block (instant)
-noscroll add <site> --grace 2m          # close only after 2 minutes on the page
-noscroll add <site> --limit 30m         # daily allowance instead of a hard block
-noscroll remove <site>                  # unblock (queued)
-noscroll remove '#3'                    # by number from `noscroll list`
-noscroll import blocklist.txt           # one rule per line
+noscroll block <site> --grace 2m       # close only after 2 minutes on the page
+noscroll import blocklist.txt          # one rule per line (e.g. from list --raw)
 ```
 
-### Discreet mode (hex-encoded sites)
+### Discreet mode (hex)
 
-The sites you most want to block are often ones you'd rather not see listed.
-noscroll can store any rule hex-encoded, so the name never appears in the
-blocklist, in `noscroll list` or in your shell history.
+The sites you most want to block are often ones you'd rather not see written
+down. Put `hex` in front of any rule command and give the site hex-encoded. It's
+stored hex-encoded, masked in `noscroll list`, and the plain name never reaches
+your shell history.
 
 ```sh
-noscroll add --prompt                   # type the site with hidden input
-noscroll add --hex 6578616d706c652e636f6d
-noscroll add example.com --hide         # hide one rule
-noscroll config discreet on             # hide everything, now and in future
-noscroll encode                         # print the hex for a site (hidden input)
+noscroll hex                                  # encode a site (hidden input) → prints hex
+noscroll hex block 6578616d706c652e636f6d     # block it by hex
+noscroll hex limit 6578616d706c652e636f6d 20m
+noscroll hex unblock 6578616d706c652e636f6d
+noscroll hex block                            # no site given: type it, hidden
+noscroll config discreet on                   # hide everything, now and in future
 ```
 
 ```console
@@ -156,20 +169,21 @@ $ noscroll list
   #    SITE                                 TYPE   RULE
   1    reddit.com                           block
   2    •••••••• (hidden)                    block
-  3    youtube.com                          block  30m/day
+  3    youtube.com                          limit  30m/day
 ```
 
-Use `noscroll list --reveal` to see hidden rules, or `noscroll unhide '#2'` /
-`noscroll hide all` to change how they're stored. Hex is about discretion, not
-encryption: anyone who decodes it can read it.
+Use `noscroll list --reveal` to see hidden rules. `noscroll hide all`,
+`hide '#2'` and `unhide '#2'` change how existing rules are stored. Hex is about
+discretion, not encryption: anyone who decodes it can read it.
 
 ### Time limits
 
 ```sh
-noscroll limit youtube.com 30m          # set (or lower: instant)
-noscroll limit youtube.com 1h           # raise: queued, because it loosens
-noscroll limit youtube.com off          # back to a full block (instant)
-noscroll usage                          # today's time on limited sites
+noscroll limit youtube.com 30m         # new or lower: instant
+noscroll limit youtube.com 1h          # higher: queued, because it loosens
+noscroll block youtube.com             # back to a full block: instant
+noscroll unlimit youtube.com           # remove the limit entirely: queued
+noscroll usage                         # today's time on limited sites
 ```
 
 Time counts only while a matching tab is the active tab and the browser is the
@@ -178,22 +192,25 @@ at local midnight. When it runs out, matching tabs close for the rest of the day
 
 ### Unlock modes
 
-| | **Password** (default) | **Timer** |
-| --- | --- | --- |
-| To loosen anything | password, then wait **10 min** | no password, wait **24 h** |
-| Delay | `--delay`, min 1 min | `--delay`, min 1 min |
-| Lost your password? | recovery code, or `noscroll forgot` (24 h) | nothing to lose |
-| Best for | casual friction | serious commitment |
+Pick one with `noscroll mode password|timer`. You can tune the three waits it
+uses at any time:
 
-```sh
-noscroll mode                           # show the current mode
-noscroll mode timer --delay 24h         # switch (queued, since it changes the rules)
-noscroll mode password --delay 15m
-```
+| Wait | Default | Used for | Set with |
+| --- | --- | --- | --- |
+| **cooldown** | 10 min | every loosening change in *password* mode, after your password | `noscroll config cooldown 15m` |
+| **timer** | 24 h | every loosening change in *timer* mode (no password) | `noscroll config timer 2d` |
+| **recover** | 24 h | `noscroll forgot`: unlocking without your password | `noscroll config recover 48h` |
 
-These all go through the queue: `remove`, `allow`, raising a `limit` or
-`--grace`, `stop`, `uninstall`, upgrades, `config strict off`, shortening the
-recovery delay and changing mode. Everything else applies instantly.
+Making a wait longer is instant. Making one shorter is queued if it's the wait
+currently protecting you (or `recover`). Changing mode is instant if the new
+mode's wait is at least as long as the current one; otherwise it's queued. A
+password is only as strong as your resolve not to type it, which is why timer
+mode skips it.
+
+These are queued: `unblock`, `unlimit`, `allow`, raising a `limit` or
+`--grace`, `stop`, `uninstall`, upgrades, `config strict off`, shortening an
+active wait, and switching to a mode with a shorter wait. Everything else
+applies instantly.
 
 ### Stopping, pausing and the queue
 
@@ -210,25 +227,23 @@ Cancelling never needs a password. The urge often passes before the delay does.
 
 ### Forgot your password?
 
-1. **Have your recovery code?** Use it anywhere noscroll asks for your password.
-2. **Lost both?** Run `noscroll forgot`. After 24 hours (or your delay, if
-   that's longer), noscroll clears the password and stops blocking, with no
-   password needed. Then run `noscroll setup-password` and `noscroll start`.
+Run `noscroll forgot`. After the **recover** wait (24 hours by default, and
+never shorter than your cooldown), noscroll clears the password and stops
+blocking. No password is needed. Then run `noscroll password` and
+`noscroll start`. You can `noscroll cancel` it any time before then.
 
 ### Settings
 
 ```sh
-noscroll config                          # show all settings
-noscroll config discreet on|off          # hex-encode and mask new rules
-noscroll config strict on|off            # quit browsers noscroll can't monitor
-noscroll config notify on|off            # macOS notifications
-noscroll config recovery-delay 48h       # how long `forgot` takes (min 1h)
+noscroll config                        # show everything
+noscroll config cooldown|timer|recover <time>
+noscroll config discreet on|off        # hex-encode and mask every rule
+noscroll config strict on|off          # quit browsers noscroll can't monitor or control
+noscroll config notify on|off          # macOS notifications
 ```
 
-### All commands
-
-Run `noscroll help` for the full list. The one you'll reach for when something
-looks wrong is `noscroll doctor`.
+Run `noscroll help` for the full command list, and `noscroll doctor` when
+something looks wrong.
 
 ## How it works
 
@@ -245,7 +260,7 @@ looks wrong is `noscroll doctor`.
        restart / re-enable the agent unless a legitimate stop is in force
 
  ~/.noscroll/
-   sites · config · auth · recovery   immutable, HMAC-signed, signed backup
+   sites · config · auth · binsum     immutable, HMAC-signed, signed backup
    pending · usage · stopped          HMAC-signed
 ```
 
@@ -255,6 +270,11 @@ looks wrong is `noscroll doctor`.
   not obeyed.
 - **The blocklist and settings are immutable** (`chflags uchg`) and signed. If
   they're edited outside noscroll, they're restored from a signed backup.
+- **The agent remembers the last good state.** If `~/.noscroll` is deleted,
+  or the signing key is replaced and edits are re-signed with the new one, the
+  agent puts back the original key and rebuilds the files from memory.
+- **The binary is checksummed.** If it's replaced or deleted, noscroll restores
+  it from a signed spare copy.
 - **Edited usage records count as used up:** that day's limits are spent.
 - **Every command heals.** Running any `noscroll` command re-creates missing
   agents, clears launchd `disable` overrides and restarts what should be
@@ -262,13 +282,26 @@ looks wrong is `noscroll doctor`.
 - **It runs under a disguise.** The agent runs from a copy in `/tmp` named after
   a random system process, so it doesn't stand out in Activity Monitor.
 
-### What it is not
+### Threat model: what can still beat it
 
-noscroll is a **commitment device** for blocking *your own* browsing on *your
-own* Mac. It runs as your user, without root. Someone who's determined, has
-admin rights and has read this source can always remove it. The aim is to make
-caving slow and deliberate, not impossible. It isn't parental-control software
-or spyware, and it doesn't hide from the person who installed it.
+noscroll runs as **your** user, without root, so anything your account can do,
+you can undo. It's built to make caving slow and deliberate, not impossible.
+These are the bypasses that remain, even for someone who has read the source:
+
+| Bypass | Why it works | Mitigation |
+| --- | --- | --- |
+| Booting out **both** agents in one command | Each agent restarts the other, but nothing restarts both. Any later `noscroll` command repairs them. | Root-owned LaunchDaemon (not yet built) |
+| Turning noscroll off in **System Settings → Login Items** | macOS's background-item switch overrides launchd | Same |
+| An unmonitored browser (Firefox, a Dock web app, a phone) | noscroll can only see scriptable browsers | `config strict on` quits known browsers it can't monitor |
+| Revoking **Automation** permission | The agent can no longer read tabs | Strict mode quits a browser that refuses control |
+| Killing the agent, then forging state before it restarts | A fresh agent has no memory to compare against | Needs the secret, the signature format and good timing |
+| Setting the clock forward | Waits are measured in wall-clock time | Changing the clock needs an admin password |
+| Proxy and mirror sites (translate proxies, alternative frontends) | They're different domains | Block them too, or use `~keyword` rules |
+
+For a lock you can't pick yourself, have someone else hold the admin password,
+or use Screen Time with a passcode set by someone else. noscroll isn't
+parental-control software or spyware, and it doesn't hide from the person who
+installed it.
 
 ## Troubleshooting
 
@@ -283,7 +316,8 @@ control that browser:
 3. If nothing's listed, run `tccutil reset AppleEvents`, then open the browser.
    The prompt will appear again.
 
-Major macOS updates sometimes reset these permissions, and that's the most
+With `config strict on`, a browser that refuses control is quit until you
+allow it. Major macOS updates sometimes reset these permissions, and that's the most
 common reason blocking stops after an update. Also check **System Settings →
 General → Login Items** and make sure background items aren't turned off for
 `bash`/noscroll.
@@ -327,8 +361,10 @@ first; `noscroll import my-rules.txt` restores them later.
 
 ## FAQ
 
-**Upgrading from v1?** Run `./install.sh`. Your blocklist, grace periods and
-password migrate automatically, and the old agent is replaced. v1 matched
+**Upgrading?** Run `./install.sh`. From v1, your blocklist, grace periods and
+password migrate automatically, and the old agent is replaced. From 2.0,
+`delay`/`recovery_delay` become `cooldown`/`timer`/`recover`, and recovery
+codes are removed. v1 matched
 anywhere in the URL. v2 matches domains, so v1 entries that weren't domains
 become `~keyword` rules and keep working as before.
 

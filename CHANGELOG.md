@@ -4,6 +4,28 @@ All notable changes to noscroll. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [semantic versioning](https://semver.org/).
 
+## [2.1.0] - 2026-11-26
+
+### Changed (breaking CLI)
+- Commands now come in obvious pairs: `block`/`unblock`, `limit`/`unlimit`,
+  `allow`/`disallow`. `add`, `remove` and `limit … off` are gone.
+- Hex input is now a prefix: `noscroll hex block <hex>`. Plain `noscroll hex`
+  encodes a site. `--hex`, `--prompt`, `--hide` and `encode` are gone.
+- `setup-password` is now `password`.
+- The waits are named and set independently: `config cooldown`,
+  `config timer` and `config recover`. `mode` no longer takes `--delay`.
+  Existing `delay`/`recovery_delay` settings migrate automatically.
+
+### Removed
+- Recovery codes. A second secret is no stronger than the password, and
+  `forgot` already covers a lost password.
+
+### Security
+- A swapped or deleted binary is restored from a signed spare copy.
+- The agent rebuilds deleted state from memory and undoes edits re-signed
+  with a replaced signing key.
+- Strict mode quits browsers whose Automation permission was revoked.
+
 ## [2.0.0] - 2026-11-26
 
 ### Fixed
@@ -39,5 +61,6 @@ uses [semantic versioning](https://semver.org/).
 - First release: Chrome and Safari tab blocker with a password, a
   10-minute cooldown and a disguised LaunchAgent.
 
+[2.1.0]: https://github.com/ben47203/noscroll/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ben47203/noscroll/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/ben47203/noscroll/releases/tag/v1.0.0

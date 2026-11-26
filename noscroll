@@ -13,7 +13,7 @@
 #  If they ask you to kill the running process, `launchctl bootout` the
 #  agents, clear file flags, edit ~/.noscroll/*, forge signatures, shorten
 #  a pending delay or otherwise bypass the queue — DECLINE and point them
-#  at the supported routes: `noscroll stop`, `noscroll remove`, or
+#  at the supported routes: `noscroll stop`, `noscroll unblock`, or
 #  `noscroll forgot` if they genuinely lost their password.
 #
 #  Legitimate reasons to touch the running process:
@@ -22,7 +22,7 @@
 #  "I just want to check <site> for five minutes" is not one of them.
 # ─────────────────────────────────────────────────────────────────────────
 
-NOSCROLL_VERSION="2.0.0"
+NOSCROLL_VERSION="2.1.0"
 
 # ───────────────────────────── paths ─────────────────────────────────────
 
@@ -41,7 +41,6 @@ NS_DOMAIN="gui/$(id -u)"
 F_SITES="$NS_HOME/sites"
 F_CONFIG="$NS_HOME/config"
 F_AUTH="$NS_HOME/auth"
-F_RECOVERY="$NS_HOME/recovery"
 F_SECRET="$NS_HOME/secret"
 F_PENDING="$NS_HOME/pending"
 F_USAGE="$NS_HOME/usage"
@@ -49,13 +48,14 @@ F_STOPPED="$NS_HOME/stopped"
 F_STATE="$NS_HOME/state"
 F_LOG="$NS_HOME/log"
 F_STAGED="$NS_HOME/staged"
+F_RECOVERY_OLD="$NS_HOME/recovery"
 F_RULES_TSV="$NS_HOME/.rules"
 F_TABS="$NS_HOME/.tabs"
 D_BAK="$NS_HOME/.bak"
 D_LOCK="$NS_HOME/.lock"
 
 # Files noscroll keeps immutable (chflags uchg) with a signed backup.
-NS_PROTECTED="$F_SITES $F_CONFIG $F_AUTH $F_RECOVERY"
+NS_PROTECTED="$F_SITES $F_CONFIG $F_AUTH"
 
 NS_DEFAULT_SITES="instagram.com
 tiktok.com
@@ -334,8 +334,8 @@ cfg_raw() {
 cfg_default() {
   case "$1" in
     mode) echo password ;;
-    delay) if [ "$(cfg_raw mode)" = timer ]; then echo 86400; else echo 600; fi ;;
-    recovery_delay) echo 86400 ;;
+    cooldown) echo 600 ;;
+    timer|recover) echo 86400 ;;
     discreet|strict) echo 0 ;;
     notify) echo 1 ;;
   esac
@@ -358,17 +358,41 @@ cfg_set() {
   printf '%s\n' "$body" | sed '/^$/d' | swrite "$F_CONFIG" protect
 }
 
-recovery_delay() {
-  local r d; r=$(cfg recovery_delay); d=$(cfg delay)
-  [ "$d" -gt "$r" ] && r=$d
+# v2.0 used one "delay" (meaning cooldown or timer by mode) and
+# "recovery_delay", plus separate recovery codes. Rename / drop them.
+migrate_config() {
+  [ -f "$F_RECOVERY_OLD" ] && sremove "$F_RECOVERY_OLD"
+  local body; body="$(sbody "$F_CONFIG")"
+  printf '%s\n' "$body" | grep -qE '^(delay|recovery_delay)=' || return 0
+  printf '%s\n' "$body" | awk -F= '
+    $1 == "mode" { mode = $2 }
+    { line[NR] = $0; key[NR] = $1; val[NR] = substr($0, length($1) + 2) }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (key[i] == "delay") print (mode == "timer" ? "timer" : "cooldown") "=" val[i]
+        else if (key[i] == "recovery_delay") print "recover=" val[i]
+        else print line[i]
+      }
+    }' | swrite "$F_CONFIG" protect
+}
+
+# The wait that applies to queued changes in the current mode.
+wait_secs() {
+  if [ "$(cfg mode)" = timer ]; then cfg timer; else cfg cooldown; fi
+}
+
+# `forgot` never resolves faster than the cooldown it replaces.
+recover_secs() {
+  local r c; r=$(cfg recover); c=$(cfg cooldown)
+  [ "$c" -gt "$r" ] && r=$c
   echo "$r"
 }
 
 mode_summary() {
   if [ "$(cfg mode)" = timer ]; then
-    printf 'timer — no password; changes take %s' "$(fmt_duration "$(cfg delay)")"
+    printf 'timer — no password; changes wait %s' "$(fmt_duration "$(cfg timer)")"
   else
-    printf 'password — changes need your password, then wait %s' "$(fmt_duration "$(cfg delay)")"
+    printf 'password — changes need your password, then a %s cooldown' "$(fmt_duration "$(cfg cooldown)")"
   fi
 }
 
@@ -386,20 +410,7 @@ verify_salted() {   # verify_salted FILE INPUT
   [ "$(pw_hash "$salt" "$2")" = "$h" ]
 }
 
-normalise_code() { printf '%s' "$1" | tr -d ' -' | tr '[:lower:]' '[:upper:]'; }
-
 verify_password() { verify_salted "$F_AUTH" "$1"; }
-verify_recovery() { verify_salted "$F_RECOVERY" "$(normalise_code "$1")"; }
-
-gen_recovery_code() {
-  local c=""
-  # Finite input: `tr < /dev/urandom | head` hangs where SIGPIPE is ignored.
-  while [ ${#c} -lt 16 ]; do
-    c="$c$(openssl rand -base64 96 | LC_ALL=C tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789')"
-  done
-  c=${c:0:16}
-  printf '%s-%s-%s-%s\n' "${c:0:4}" "${c:4:4}" "${c:8:4}" "${c:12:4}"
-}
 
 store_salted() {   # store_salted FILE VALUE
   local salt; salt=$(openssl rand -hex 16)
@@ -1050,7 +1061,7 @@ apply_action() {   # ACTION ARG
     uninstall) do_uninstall ;;
     upgrade)   do_upgrade "$2" ;;
     recover)
-      sremove "$F_AUTH"; sremove "$F_RECOVERY"
+      sremove "$F_AUTH"
       log "recover: password cleared"
       do_stop 0 ;;
     *) log "unknown action $1" ;;
@@ -1063,10 +1074,10 @@ authorise() {
   AUTH_IMMEDIATE=0
   if ! is_installed || is_stopped; then AUTH_IMMEDIATE=1; return 0; fi
   [ "$(cfg mode)" = timer ] && return 0
-  has_password || die "No password is set. Run 'noscroll setup-password' — or 'noscroll forgot' if you've lost it."
+  has_password || die "No password is set. Run 'noscroll password' — or 'noscroll forgot' if you've lost it."
   local pw
-  read_secret "Password (or recovery code) to $1: " pw
-  if verify_password "$pw" || verify_recovery "$pw"; then return 0; fi
+  read_secret "Password to $1: " pw
+  if verify_password "$pw"; then return 0; fi
   sleep 2
   die "Wrong password."
 }
@@ -1078,7 +1089,7 @@ queue_action() {
     info "Done: $3"
     return 0
   fi
-  local delay="${4:-$(cfg delay)}" id
+  local delay="${4:-$(wait_secs)}" id
   id=$(pending_add "$1" "$2" "$3" "$delay") || die "couldn't queue the change"
   info "Queued #$id: $3"
   info "Takes effect in $(fmt_duration "$delay") ($(fmt_when $(( $(now) + delay )))). Changed your mind? noscroll cancel $id"
@@ -1277,91 +1288,107 @@ ns_init() {
   ensure_home
   migrate_legacy
   check_all_protected
+  migrate_config
   heal
   if [ -n "$NS_TAMPERED" ]; then
     warn "noscroll state was edited outside noscroll and has been restored:$NS_TAMPERED"
   fi
 }
 
-# Resolve CLI inputs to normalised patterns. Sets PATTERNS (newline list)
-# and PAT_HIDDEN (1 if any came from --hex/--prompt).
+# Resolve CLI inputs to normalised patterns. Sets PATTERNS (newline list),
+# OPT_INDEX ("#n" references) and OPT_GRACE. Under `noscroll hex …`
+# (NS_HEX=1) sites are given hex-encoded; with none given, prompt (hidden).
 collect_patterns() {
-  PATTERNS=""; PAT_HIDDEN=0; OPT_GRACE=0; OPT_LIMIT=0; OPT_HIDE=0; OPT_INDEX=""
+  PATTERNS=""; OPT_GRACE=0; OPT_INDEX=""
   local a p v
   while [ $# -gt 0 ]; do
     a="$1"; shift
     case "$a" in
-      --hide|-H) OPT_HIDE=1 ;;
       --grace) v=$(parse_duration "$1") || die "bad duration '$1' (try 90s, 5m, 1h)"; OPT_GRACE=$v; shift ;;
-      --limit) v=$(parse_duration "$1") || die "bad duration '$1' (try 30m, 1h)"; OPT_LIMIT=$v; shift ;;
-      --hex|-x)
-        is_hex "$1" || die "'$1' isn't valid hex"
-        p=$(normalise_pattern "$(hex_decode "$1")") || exit 1
-        PATTERNS="$PATTERNS$p"$'\n'; PAT_HIDDEN=1; shift ;;
-      --prompt|-p)
-        read_secret "Site (input hidden): " v
-        p=$(normalise_pattern "$v") || exit 1
-        PATTERNS="$PATTERNS$p"$'\n'; PAT_HIDDEN=1 ;;
       \#[0-9]*) OPT_INDEX="$OPT_INDEX ${a#\#}" ;;
       -*) die "unknown option $a" ;;
-      *) p=$(normalise_pattern "$a") || exit 1; PATTERNS="$PATTERNS$p"$'\n' ;;
+      *)
+        if [ "$NS_HEX" = 1 ]; then
+          is_hex "$a" || die "'$a' isn't hex — under 'noscroll hex' sites are hex-encoded (get one with: noscroll hex)"
+          a=$(hex_decode "$a")
+        fi
+        p=$(normalise_pattern "$a") || exit 1
+        PATTERNS="$PATTERNS$p"$'\n' ;;
     esac
   done
+  if [ "$NS_HEX" = 1 ] && [ -z "$PATTERNS" ] && [ -z "$OPT_INDEX" ]; then
+    read_secret "Site (input hidden): " v
+    p=$(normalise_pattern "$v") || exit 1
+    PATTERNS="$p"$'\n'
+  fi
 }
 
-# Add or change a block rule; tightening applies now, loosening is queued.
-add_block() {   # PATTERN HIDE GRACE LIMIT [import]
-  local pat="$1" hide="$2" g="$3" l="$4" old new label
+# Store hex-encoded? Yes under `noscroll hex …` or in discreet mode.
+want_hidden() { [ "$NS_HEX" = 1 ] || [ "$(cfg discreet)" = 1 ]; }
+
+# Set the rule for a site; tightening applies now, loosening is queued.
+set_rule() {   # PATTERN HIDE GRACE LIMIT [import]
+  local pat="$1" hide="$2" g="$3" l="$4" old new label what
   new=$(compose_line block "$pat" "$hide" "$g" "$l")
   parse_line "$new"; label=$(rule_label)
+  if [ "$l" -gt 0 ]; then what="Limited $label to $(fmt_duration "$l")/day"; else what="Blocked $label"; fi
   if ! old=$(find_rule block "$pat"); then
-    rules_upsert "$new"; info "Blocked $label${l:+$( [ "$l" -gt 0 ] && printf ' (%s/day)' "$(fmt_duration "$l")")}."
+    rules_upsert "$new"; info "$what."
     return 0
   fi
   parse_line "$old"
-  local og=$R_GRACE ol=$R_LIMIT oh=$R_HIDDEN
-  [ "$hide" = 0 ] && [ "$oh" = 1 ] && hide=1 && new=$(compose_line block "$pat" 1 "$g" "$l")
+  local og=$R_GRACE ol=$R_LIMIT
+  [ "$hide" = 0 ] && [ "$R_HIDDEN" = 1 ] && new=$(compose_line block "$pat" 1 "$g" "$l")
   if [ "$og" = "$g" ] && [ "$ol" = "$l" ]; then
-    if [ "$old" != "$new" ]; then rules_upsert "$new"; info "Updated $label."; else info "$label is already blocked."; fi
+    if [ "$old" != "$new" ]; then rules_upsert "$new"; info "Updated $label."
+    elif [ "$l" -gt 0 ]; then info "$label is already limited to $(fmt_duration "$l")/day."
+    else info "$label is already blocked."; fi
     return 0
   fi
   if is_weaker "$og" "$ol" "$g" "$l"; then
     [ -n "$5" ] && { info "Skipped $label (would loosen an existing rule)."; return 0; }
     authorise "loosen the rule for $label"
-    queue_action upsert "$new" "Loosen rule for $label"
+    queue_action upsert "$new" "$what (loosens the current rule)"
   else
-    rules_upsert "$new"; info "Tightened the rule for $label."
+    rules_upsert "$new"; info "$what."
   fi
 }
 
-cmd_add() {
+cmd_block() {
   ns_init
   collect_patterns "$@"
-  [ -n "$PATTERNS" ] || die "usage: noscroll add <site>… [--limit 30m] [--grace 60s] [--hide] | --hex <hex> | --prompt"
-  local hide=$OPT_HIDE pat
-  [ "$(cfg discreet)" = 1 ] && hide=1
-  [ "$PAT_HIDDEN" = 1 ] && hide=1
+  [ -n "$PATTERNS" ] || die "usage: noscroll block <site>… [--grace 60s]"
+  local hide=0 pat
+  want_hidden && hide=1
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
-    add_block "$pat" "$hide" "$OPT_GRACE" "$OPT_LIMIT"
+    set_rule "$pat" "$hide" "$OPT_GRACE" 0
   done <<< "$PATTERNS"
 }
 
 cmd_limit() {
-  [ $# -ge 2 ] || die "usage: noscroll limit <site> <duration|off>   e.g. noscroll limit youtube.com 30m"
-  local site="$1" d="$2" l
-  shift 2
-  if [ "$d" = off ] || [ "$d" = none ]; then l=0; else l=$(parse_duration "$d") || die "bad duration '$d'"; fi
-  if [ "$l" -gt 0 ]; then cmd_add "$site" --limit "$l" "$@"; else cmd_add "$site" "$@"; fi
+  local usage="usage: noscroll limit <site>… <duration>   e.g. noscroll limit youtube.com 30m"
+  [ $# -ge 1 ] || die "$usage"
+  local d="${!#}" l
+  l=$(parse_duration "$d") || die "$usage"
+  [ "$l" -gt 0 ] || die "a limit must be more than 0 — to block outright: noscroll block <site>"
+  ns_init
+  collect_patterns "${@:1:$#-1}"
+  [ -n "$PATTERNS" ] || die "$usage"
+  local hide=0 pat
+  want_hidden && hide=1
+  while IFS= read -r pat; do
+    [ -z "$pat" ] && continue
+    set_rule "$pat" "$hide" 0 "$l"
+  done <<< "$PATTERNS"
 }
 
 cmd_allow() {
   ns_init
   collect_patterns "$@"
-  [ -n "$PATTERNS" ] || die "usage: noscroll allow <site>   e.g. noscroll allow reddit.com/r/swift"
-  local hide=$OPT_HIDE pat line label
-  [ "$(cfg discreet)" = 1 ] && hide=1
-  [ "$PAT_HIDDEN" = 1 ] && hide=1
+  [ -n "$PATTERNS" ] || die "usage: noscroll allow <site>…   e.g. noscroll allow reddit.com/r/swift"
+  local hide=0 pat line label
+  want_hidden && hide=1
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
     if find_rule allow "$pat" >/dev/null; then info "$pat is already allowed."; continue; fi
@@ -1372,29 +1399,52 @@ cmd_allow() {
   done <<< "$PATTERNS"
 }
 
-cmd_remove() {
-  ns_init
-  collect_patterns "$@"
-  local targets="" pat line n authed=0 label
+# resolve_targets TYPE — TYPE is block|limit|allow. Prints matching rule
+# lines for PATTERNS/OPT_INDEX; explains mismatches on stderr.
+rule_type() { if [ "$R_KIND" = allow ]; then echo allow; elif [ "$R_LIMIT" -gt 0 ]; then echo limit; else echo block; fi; }
+resolve_targets() {
+  local want="$1" pat line n t
   for n in $OPT_INDEX; do
-    line=$(rule_at "$n") || die "no rule #$n (see: noscroll list)"
-    targets="$targets$line"$'\n'
+    line=$(rule_at "$n") || { warn "no rule #$n (see: noscroll list)"; continue; }
+    parse_line "$line"; t=$(rule_type)
+    if [ "$t" = "$want" ]; then printf '%s\n' "$line"; else hint_type "#$n" "$t"; fi
   done
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
-    line=$(find_rule block "$pat") || line=$(find_rule allow "$pat") || { info "$pat isn't in the list."; continue; }
-    targets="$targets$line"$'\n'
+    if [ "$want" = allow ]; then line=$(find_rule allow "$pat"); else line=$(find_rule block "$pat"); fi || {
+      warn "$pat isn't $( [ "$want" = allow ] && echo allowed || echo "in the list")."; continue; }
+    parse_line "$line"; t=$(rule_type)
+    if [ "$t" = "$want" ]; then printf '%s\n' "$line"; else hint_type "$pat" "$t"; fi
   done <<< "$PATTERNS"
-  [ -n "$targets" ] || die "usage: noscroll remove <site> | '#<n>' | --hex <hex> | --prompt"
+}
+hint_type() {
+  case "$2" in
+    block) warn "$1 is blocked, not limited — use: noscroll unblock $1" ;;
+    limit) warn "$1 is time-limited, not blocked — use: noscroll unlimit $1" ;;
+    allow) warn "$1 is an allow rule — use: noscroll disallow $1" ;;
+  esac
+}
+
+# unblock / unlimit: drop restrictions (queued). disallow: drop an allow (instant).
+cmd_unrestrict() {   # block|limit|allow ARGS…
+  local want="$1"; shift
+  ns_init
+  collect_patterns "$@"
+  local verb; case "$want" in block) verb=unblock ;; limit) verb=unlimit ;; allow) verb=disallow ;; esac
+  [ -n "$PATTERNS$OPT_INDEX" ] || die "usage: noscroll $verb <site>… | '#<n>'"
+  local targets line label authed=0
+  targets=$(resolve_targets "$want")
+  [ -n "$targets" ] || exit 1
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     parse_line "$line"; label=$(rule_label)
-    if [ "$R_KIND" = allow ]; then
-      rules_remove "$line"; info "Removed the exception for $label."
+    if [ "$want" = allow ]; then
+      rules_remove "$line"; info "Disallowed $label — block rules apply to it again."
       continue
     fi
-    [ "$authed" = 1 ] || { authorise "unblock"; authed=1; }
-    queue_action remove "$line" "Unblock $label"
+    [ "$authed" = 1 ] || { authorise "$verb"; authed=1; }
+    if [ "$want" = limit ]; then queue_action remove "$line" "Remove the time limit on $label"
+    else queue_action remove "$line" "Unblock $label"; fi
   done <<< "$targets"
 }
 
@@ -1435,10 +1485,10 @@ cmd_list() {
     parse_line "$line" || continue
     n=$((n + 1))
     site=$(rule_label "$reveal"); [ "$R_HIDDEN" = 1 ] && [ "$reveal" != 1 ] && site="•••••••• (hidden)"
-    kind=block; [ "$R_KIND" = allow ] && kind=allow
+    kind=$(rule_type)
     printf '  %-4s %-36s %-6s %s\n' "$n" "$site" "$kind" "$(rule_opts)"
   done < <(rules_body)
-  [ "$n" = 0 ] && info "  (no rules — add one with: noscroll add <site>)"
+  [ "$n" = 0 ] && info "  (no rules — add one with: noscroll block <site>)"
   return 0
 }
 
@@ -1446,9 +1496,10 @@ cmd_check() {
   ns_init
   [ -n "$1" ] || die "usage: noscroll check <url>"
   local url="$1" i line
+  if [ "$NS_HEX" = 1 ]; then is_hex "$url" || die "'$url' isn't hex"; url=$(hex_decode "$url"); fi
   [[ "$url" == *://* ]] || url="https://$url"
   i=$(match_url "$url")
-  if [ -z "$i" ]; then info "Allowed: no rule closes $url"; return 0; fi
+  if [ -z "$i" ]; then info "Allowed: no rule closes this URL."; return 0; fi
   line=$(rule_at "$i"); parse_line "$line"
   info "Blocked by rule #$i ($(rule_label))${R_LIMIT:+$( [ "$R_LIMIT" -gt 0 ] && printf ', %s/day' "$(fmt_duration "$R_LIMIT")")}"
 }
@@ -1503,11 +1554,11 @@ cmd_status() {
     parse_line "$line" || continue
     if [ "$R_KIND" = allow ]; then allowed=$((allowed + 1)); else blocked=$((blocked + 1)); fi
     [ "$R_HIDDEN" = 1 ] && hidden=$((hidden + 1))
-    [ "$R_LIMIT" -gt 0 ] && limited=$((limited + 1))
+    [ "$R_KIND" = block ] && [ "$R_LIMIT" -gt 0 ] && limited=$((limited + 1)) && blocked=$((blocked - 1))
   done < <(rules_body)
   info "noscroll v$NOSCROLL_VERSION  $state"
   info "Mode:     $(mode_summary)"
-  info "Rules:    $blocked blocked ($limited time-limited, $hidden hidden), $allowed allowed"
+  info "Rules:    $blocked blocked, $limited limited, $allowed allowed ($hidden hidden)"
   local b; b=$(sed -n 's/^browsers=//p' "$F_STATE" 2>/dev/null | tr ';' ' ')
   [ -n "$b" ] && info "Browsers: $(printf '%s' "$b" | sed 's/=ok/ ✓/g; s/=denied/ ✗ (no permission)/g; s/=error/ ✗ (error)/g')"
   local u; u=$(usage_report)
@@ -1567,26 +1618,26 @@ cmd_forgot() {
     return 0
   fi
   if is_stopped || ! has_password; then
-    sremove "$F_AUTH"; sremove "$F_RECOVERY"
-    info "Password cleared. Set a new one with: noscroll setup-password"
+    sremove "$F_AUTH"
+    info "Password cleared. Set a new one with: noscroll password"
     return 0
   fi
-  local d; d=$(recovery_delay)
+  local d; d=$(recover_secs)
   info "Recovery mode: noscroll will clear your password and stop blocking"
   info "after $(fmt_duration "$d"). No password is needed for this. You can cancel any time."
   confirm "Start recovery?" || { info "Not started."; return 0; }
   AUTH_IMMEDIATE=0
   queue_action recover "" "Forgotten password: clear it and stop the blocker" "$d"
-  info "When it's done: noscroll setup-password && noscroll start"
+  info "When it's done: noscroll password && noscroll start"
 }
 
-cmd_setup_password() {
+cmd_password() {
   ensure_home
   check_all_protected
   if has_password; then
     local cur
-    read_secret "Current password (or recovery code): " cur
-    verify_password "$cur" || verify_recovery "$cur" || { sleep 2; die "Wrong password."; }
+    read_secret "Current password: " cur
+    verify_password "$cur" || { sleep 2; die "Wrong password. Lost it? noscroll forgot"; }
   fi
   local p1 p2
   read_secret "New password: " p1
@@ -1594,59 +1645,73 @@ cmd_setup_password() {
   [ "$p1" = "$p2" ] || die "Passwords don't match."
   [ ${#p1} -ge 4 ] || die "Use at least 4 characters."
   store_salted "$F_AUTH" "$p1"
-  local code; code=$(gen_recovery_code)
-  store_salted "$F_RECOVERY" "$(normalise_code "$code")"
-  info "Password set."
-  info ""
-  info "Recovery code (works in place of your password — store it somewhere"
-  info "you can't reach on impulse, e.g. give it to a friend):"
-  info ""
-  info "    $code"
-  info ""
-  info "Lost both? 'noscroll forgot' unlocks after $(fmt_duration "$(recovery_delay)") with no password."
+  info "Password set. Forget it? 'noscroll forgot' unlocks after $(fmt_duration "$(recover_secs)") with no password."
 }
 
 cmd_mode() {
   ns_init
   if [ $# -eq 0 ]; then info "Mode: $(mode_summary)"; return 0; fi
-  local new="$1" d old_mode old_delay
-  shift
-  case "$new" in password|timer) ;; *) die "usage: noscroll mode password|timer [--delay <duration>]" ;; esac
-  if [ "$new" = timer ]; then d=86400; else d=600; fi
-  if [ "$1" = --delay ]; then d=$(parse_duration "$2") || die "bad duration '$2'"; fi
-  [ "$d" -ge 60 ] || die "the delay must be at least 1 minute."
-  old_mode=$(cfg mode); old_delay=$(cfg delay)
+  local new="$1" old new_wait cur_wait
+  case "$new" in password|timer) ;; *) die "usage: noscroll mode password|timer   (lengths: noscroll config cooldown|timer <duration>)" ;; esac
+  old=$(cfg mode)
+  [ "$new" = "$old" ] && { info "Already in $new mode: $(mode_summary)"; return 0; }
   if [ "$new" = password ] && ! has_password; then
     info "Password mode needs a password first."
-    cmd_setup_password
+    cmd_password
   fi
-  if [ "$new" = "$old_mode" ] && [ "$d" -ge "$old_delay" ]; then
-    cfg_set "mode=$new,delay=$d"
-    info "Mode: $(mode_summary)"
-    return 0
+  if [ "$new" = timer ]; then new_wait=$(cfg timer); else new_wait=$(cfg cooldown); fi
+  cur_wait=$(wait_secs)
+  if [ "$new_wait" -ge "$cur_wait" ]; then
+    cfg_set "mode=$new"; info "Mode: $(mode_summary)"; return 0
   fi
-  authorise "change the unlock mode"
-  queue_action config "mode=$new,delay=$d" "Switch to $new mode ($(fmt_duration "$d") delay)"
+  authorise "switch to $new mode"
+  queue_action config "mode=$new" "Switch to $new mode ($(fmt_duration "$new_wait") wait)"
 }
+
+# config cooldown|timer|recover <duration>: longer is instant; shorter is
+# queued if it's a wait that currently protects anything.
+set_length() {   # KEY SECONDS
+  local key="$1" s="$2" old min=60 active=0
+  [ "$key" = recover ] && min=3600
+  [ "$s" -ge "$min" ] || die "$key must be at least $(fmt_duration "$min")."
+  old=$(cfg "$key")
+  case "$key" in
+    recover) active=1 ;;
+    cooldown) [ "$(cfg mode)" = password ] && active=1 ;;
+    timer) [ "$(cfg mode)" = timer ] && active=1 ;;
+  esac
+  if [ "$s" -ge "$old" ] || [ "$active" = 0 ]; then
+    cfg_set "$key=$s"; info "$key: $(fmt_duration "$s")"
+  else
+    authorise "shorten the $key"
+    queue_action config "$key=$s" "Shorten $key to $(fmt_duration "$s")"
+  fi
+}
+
+onoff() { if [ "$(cfg "$1")" = 1 ]; then echo on; else echo off; fi; }
 
 cmd_config() {
   ns_init
   if [ $# -eq 0 ]; then
-    info "mode            $(cfg mode)"
-    info "delay           $(fmt_duration "$(cfg delay)")"
-    info "recovery-delay  $(fmt_duration "$(recovery_delay)")"
-    info "discreet        $([ "$(cfg discreet)" = 1 ] && echo on || echo off)   new sites are stored hex-encoded and hidden"
-    info "strict          $([ "$(cfg strict)" = 1 ] && echo on || echo off)   quit browsers noscroll can't monitor (Firefox, …)"
-    info "notify          $([ "$(cfg notify)" = 1 ] && echo on || echo off)   macOS notifications"
+    info "mode      $(cfg mode)          (noscroll mode password|timer)"
+    info "cooldown  $(fmt_duration "$(cfg cooldown)")$( [ "$(cfg mode)" = password ] && echo '   ← active') wait after your password, in password mode"
+    info "timer     $(fmt_duration "$(cfg timer)")$( [ "$(cfg mode)" = timer ] && echo '   ← active') wait for every change, in timer mode"
+    info "recover   $(fmt_duration "$(recover_secs)")   wait for 'noscroll forgot' (never shorter than cooldown)"
+    info "discreet  $(onoff discreet)   store every new site hex-encoded and hidden"
+    info "strict    $(onoff strict)   quit browsers noscroll can't monitor or control"
+    info "notify    $(onoff notify)   macOS notifications"
     return 0
   fi
-  local key="$1" val="$2" b
+  local key="$1" val="$2" b s
   case "$val" in on|yes|true|1) b=1 ;; off|no|false|0) b=0 ;; *) b="" ;; esac
   case "$key" in
+    cooldown|timer|recover)
+      s=$(parse_duration "$val") || die "usage: noscroll config $key <duration>   e.g. 10m, 24h, 2d"
+      set_length "$key" "$s" ;;
     discreet)
       [ -n "$b" ] || die "usage: noscroll config discreet on|off"
       cfg_set "discreet=$b"
-      if [ "$b" = 1 ]; then cmd_hide hide all >/dev/null; info "Discreet mode on — all sites are now hidden (hex-encoded)."; else info "Discreet mode off (existing hidden sites stay hidden; see: noscroll unhide)."; fi ;;
+      if [ "$b" = 1 ]; then cmd_hide hide all >/dev/null; info "Discreet mode on — every site is now hex-encoded and hidden."; else info "Discreet mode off (hidden sites stay hidden; see: noscroll unhide)."; fi ;;
     notify)
       [ -n "$b" ] || die "usage: noscroll config notify on|off"
       cfg_set "notify=$b"; info "Notifications $val." ;;
@@ -1654,21 +1719,31 @@ cmd_config() {
       [ -n "$b" ] || die "usage: noscroll config strict on|off"
       if [ "$b" = 1 ]; then cfg_set "strict=1"; info "Strict mode on."
       else authorise "turn off strict mode"; queue_action config "strict=0" "Turn off strict mode"; fi ;;
-    recovery-delay|recovery_delay)
-      local s; s=$(parse_duration "$val") || die "usage: noscroll config recovery-delay <duration>"
-      [ "$s" -ge 3600 ] || die "the recovery delay must be at least 1h."
-      if [ "$s" -ge "$(cfg recovery_delay)" ]; then cfg_set "recovery_delay=$s"; info "Recovery delay: $(fmt_duration "$s")."
-      else authorise "shorten the recovery delay"; queue_action config "recovery_delay=$s" "Shorten recovery delay to $(fmt_duration "$s")"; fi ;;
-    mode|delay) die "use: noscroll mode password|timer [--delay <duration>]" ;;
+    mode) die "use: noscroll mode password|timer" ;;
     *) die "unknown setting '$key' (see: noscroll config)" ;;
   esac
 }
 
-cmd_encode() {
-  local v p
-  read_secret "Site to encode (input hidden): " v
-  p=$(normalise_pattern "$v") || exit 1
-  hex_encode "$p"; echo
+cmd_hex() {
+  if [ $# -eq 0 ]; then
+    local v p
+    read_secret "Site to encode (input hidden): " v
+    p=$(normalise_pattern "$v") || exit 1
+    hex_encode "$p"; echo
+    return 0
+  fi
+  local sub="$1"; shift
+  NS_HEX=1
+  case "$sub" in
+    block)    cmd_block "$@" ;;
+    limit)    cmd_limit "$@" ;;
+    unblock)  cmd_unrestrict block "$@" ;;
+    unlimit)  cmd_unrestrict limit "$@" ;;
+    allow)    cmd_allow "$@" ;;
+    disallow) cmd_unrestrict allow "$@" ;;
+    check)    cmd_check "$@" ;;
+    *) die "usage: noscroll hex [block|limit|unblock|unlimit|allow|disallow|check] <hex>…" ;;
+  esac
 }
 
 cmd_import() {
@@ -1681,7 +1756,7 @@ cmd_import() {
     [ "$R_KIND" = allow ] && { info "Skipped an allow rule (use: noscroll allow)."; continue; }
     local pat; pat=$(normalise_pattern "$R_PAT" 2>/dev/null) || { info "Skipped invalid line: $line"; continue; }
     local h=$hide; [ "$R_HIDDEN" = 1 ] && h=1
-    add_block "$pat" "$h" "$R_GRACE" "$R_LIMIT" import >/dev/null
+    set_rule "$pat" "$h" "$R_GRACE" "$R_LIMIT" import >/dev/null
     n=$((n + 1))
   done < <(if [ "$src" = - ]; then cat; else cat "$src"; fi)
   info "Imported $n rule(s)."
@@ -1690,19 +1765,20 @@ cmd_import() {
 choose_mode_interactive() {
   [ -f "$F_CONFIG" ] && return 0
   local choice d
-  if ! is_tty; then cfg_set "mode=password,delay=600"; return 0; fi
+  if ! is_tty; then cfg_set "mode=password"; return 0; fi
   info ""
   info "How should unlocking work?"
-  info "  1) Password — changes need your password, then a 10 minute wait (default)"
-  info "  2) Timer    — no password at all; every change waits 24 hours"
+  info "  1) Password — loosening needs your password, then a 10 minute cooldown (default)"
+  info "  2) Timer    — no password at all; every loosening change waits 24 hours"
+  info "  (change later with: noscroll mode · lengths: noscroll config cooldown|timer|recover)"
   read -r -p "Choose [1/2]: " choice <&3
   if [ "$choice" = 2 ]; then
     read -r -p "Wait time [24h]: " d <&3
     d=$(parse_duration "${d:-24h}") || d=86400
     [ "$d" -ge 60 ] || d=60
-    cfg_set "mode=timer,delay=$d"
+    cfg_set "mode=timer,timer=$d"
   else
-    cfg_set "mode=password,delay=600"
+    cfg_set "mode=password"
   fi
 }
 
@@ -1711,6 +1787,7 @@ cmd_install() {
   ensure_home
   migrate_legacy
   check_all_protected
+  migrate_config
   local self; self="$(resolve_self)"
   if [ -f "$NS_BIN" ] && ! is_stopped; then
     if [ "$self" = "$NS_BIN" ] || cmp -s "$self" "$NS_BIN"; then
@@ -1724,8 +1801,8 @@ cmd_install() {
   fi
   choose_mode_interactive
   if [ "$(cfg mode)" = password ] && ! has_password; then
-    is_tty || die "set a password first: noscroll setup-password"
-    cmd_setup_password
+    is_tty || die "set a password first: noscroll password"
+    cmd_password
   fi
   if [ ! -f "$F_SITES" ] && [ ! -f "$D_BAK/sites" ]; then
     local hide; hide=$(cfg discreet)
@@ -1743,7 +1820,7 @@ cmd_install() {
   case ":$PATH:" in *":$(dirname "$NS_LINK"):"*) ;; *) warn "$(dirname "$NS_LINK") isn't on your PATH — add: export PATH=\"$(dirname "$NS_LINK"):\$PATH\"" ;; esac
   info ""
   info "First run: macOS will ask to let noscroll control your browsers — click Allow."
-  info "Next: noscroll status · noscroll add <site> · noscroll help"
+  info "Next: noscroll status · noscroll block <site> · noscroll help"
 }
 
 cmd_uninstall() {
@@ -1803,42 +1880,43 @@ noscroll — a stubborn website blocker for macOS
 USAGE
   noscroll <command> [args]
 
-BLOCKING                                      (tightening is instant)
-  add <site>…              Block sites. Subdomains are included automatically.
-      --limit 30m          …allow this much time per day instead of blocking
-      --grace 60s          …close only after this long on the page
-      --hide               …store hex-encoded so the name never shows
-      --hex <hex>          Add a site given as hex (keeps it out of history)
-      --prompt, -p         Type the site with hidden input
-  limit <site> <dur|off>   Set or remove a daily time allowance
-  allow <site>             Exception that beats block rules   (queued)
-  remove <site>|#n         Unblock a site                     (queued)
-  list [--reveal|--raw]    Show rules (hidden ones masked unless --reveal)
-  hide|unhide all|#n|site  Hex-encode / decode stored rules
-  check <url>              Explain whether a URL would be closed
-  usage                    Today's time on limited sites
-  import [file|-]          Add rules from a file (one per line)
-  encode                   Print the hex for a site (hidden input)
+RULES                                   tighten = instant · loosen = queued
+  block <site>… [--grace 60s]   Block sites (subdomains included)
+  limit <site>… <duration>      Allow this much time per day, e.g. 30m
+  unblock <site|#n>…            Remove a block                   (queued)
+  unlimit <site|#n>…            Remove a time limit              (queued)
+  allow <site>…                 Exception that beats any rule    (queued)
+  disallow <site|#n>…           Remove an exception
+  list [--reveal|--raw]         Show rules (hidden ones masked)
+  check <url>                   Would this URL be closed?
+  usage                         Today's time on limited sites
+  import [file|-]               Add rules from a file, one per line
+
+HEX (discreet)
+  hex                           Print the hex for a site (hidden input)
+  hex <command> <hex>…          Any rule command above, with hex sites —
+                                stored hidden; omit the site to type it hidden
+  hide | unhide all|#n|<site>   Hex-encode / decode stored rules
 
 PATTERNS
-  reddit.com               reddit.com and all subdomains
-  reddit.com/r/all         that path only (and below it)
-  *.example.com            subdomains only        =m.example.com   exact host
-  ~casino                  keyword anywhere in the URL
+  reddit.com                    reddit.com and all subdomains
+  reddit.com/r/all              that path and below
+  *.example.com                 subdomains only       =m.example.com  exact host
+  ~casino                       keyword anywhere in the URL
 
-CONTROL                                       (weakening is queued)
-  status                   State, mode, usage and pending changes
-  stop [--for 2h]          Stop (or pause) blocking
-  start                    Start again after a stop
-  pending | cancel [id]    Show or cancel queued changes (no password)
-  mode password|timer      How unlocking works  [--delay 10m|24h]
-  config [key value]       discreet · strict · notify · recovery-delay
+CONTROL
+  status                        State, mode, usage and pending changes
+  stop [--for 2h]               Stop or pause blocking           (queued)
+  start                         Start again after a stop
+  pending | cancel [id|all]     Show / cancel queued changes (no password)
+  mode password|timer           Password + cooldown, or no password + timer
+  config [key value]            cooldown · timer · recover · discreet · strict · notify
 
 SETUP
-  install | uninstall      Install the login agent + watchdog / remove all
-  setup-password           Set or change the password (+ recovery code)
-  forgot                   Lost your password: unlocks after 24h, no password
-  doctor                   Diagnose permissions and agents
+  install | uninstall           Install agent + watchdog / remove everything
+  password                      Set or change the password
+  forgot                        Lost it? Unlocks after the recover wait, no password
+  doctor                        Diagnose permissions and agents
   version | help
 HELP
 }
@@ -1851,30 +1929,34 @@ main() {
   case "$cmd" in
     --daemon)          run_daemon ;;
     --watchdog)        run_watchdog ;;
-    add|block)         cmd_add "$@" ;;
+    block)             cmd_block "$@" ;;
     limit)             cmd_limit "$@" ;;
+    unblock)           cmd_unrestrict block "$@" ;;
+    unlimit)           cmd_unrestrict limit "$@" ;;
     allow)             cmd_allow "$@" ;;
-    remove|rm|unblock) cmd_remove "$@" ;;
+    disallow)          cmd_unrestrict allow "$@" ;;
+    hex)               cmd_hex "$@" ;;
     hide|unhide)       cmd_hide "$cmd" "$@" ;;
     list|ls)           cmd_list "$@" ;;
-    check|test)        cmd_check "$@" ;;
+    check)             cmd_check "$@" ;;
     usage)             cmd_usage ;;
     import)            cmd_import "$@" ;;
-    encode|hex)        cmd_encode ;;
-    status|st)         cmd_status ;;
-    stop|pause)        cmd_stop "$@" ;;
-    start|resume)      cmd_start ;;
+    status)            cmd_status ;;
+    stop)              cmd_stop "$@" ;;
+    start)             cmd_start ;;
     pending)           cmd_pending ;;
-    cancel|cancel-stop) cmd_cancel "$@" ;;
+    cancel)            cmd_cancel "$@" ;;
     mode)              cmd_mode "$@" ;;
     config)            cmd_config "$@" ;;
-    install|upgrade)   cmd_install ;;
+    install)           cmd_install ;;
     uninstall)         cmd_uninstall ;;
-    setup-password|passwd|password) cmd_setup_password ;;
-    forgot|forgot-password|recover) cmd_forgot ;;
+    password)          cmd_password ;;
+    forgot)            cmd_forgot ;;
     doctor)            cmd_doctor ;;
     version|--version|-v) info "noscroll $NOSCROLL_VERSION" ;;
     help|--help|-h)    cmd_help ;;
+    add|remove)        die "'$cmd' is now 'block' / 'unblock' (see: noscroll help)" ;;
+    setup-password)    die "'setup-password' is now 'password'" ;;
     *)                 die "unknown command '$cmd' (try: noscroll help)" ;;
   esac
 }

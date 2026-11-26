@@ -300,9 +300,11 @@ whenever they open.
 <details>
 <summary><b>Private windows, web apps and other gaps</b></summary>
 
-Safari and Chromium private windows are checked like any other window. Web
-apps added to the Dock (Safari's *Add to Dock*, Chrome's *Install app*) run as
-separate apps that can't be scripted, so they aren't checked.
+Private windows are normally visible to AppleScript and are checked like any
+other window. Check yours by opening a blocked site in one: `noscroll doctor`
+lists the tab count each browser reports. Web apps added to the Dock (Safari's
+*Add to Dock*, Chrome's *Install app*) run as separate apps that can't be
+scripted, so they aren't checked.
 </details>
 
 <details>

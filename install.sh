@@ -1,37 +1,35 @@
 #!/bin/bash
-# noscroll installer — copies the script onto your PATH, sets a password,
-# and registers the LaunchAgent so the blocker survives reboots and kills.
+# noscroll installer.
+#
+#   From a checkout:   ./install.sh
+#   One line:          curl -fsSL https://raw.githubusercontent.com/ben47203/noscroll/main/install.sh | bash
+#
+# Copies noscroll into ~/Library/Application Support/noscroll, links it as
+# ~/.local/bin/noscroll, asks how unlocking should work, and starts the
+# login agent + watchdog. Re-running it on an existing install queues an
+# upgrade (password and/or delay, like any other change).
 set -euo pipefail
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PREFIX="${PREFIX:-$HOME/.local/bin}"
-DEST="$PREFIX/noscroll"
+REPO="${NOSCROLL_REPO:-ben47203/noscroll}"
+REF="${NOSCROLL_REF:-main}"
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo "noscroll only works on macOS (it drives Chrome/Safari via AppleScript)."
-  exit 1
+[ "$(uname)" = "Darwin" ] || { echo "noscroll only runs on macOS."; exit 1; }
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/noscroll" ]; then
+  SRC="$SRC_DIR/noscroll"
+else
+  TMP="$(mktemp -d)"
+  trap 'rm -rf "$TMP"' EXIT
+  echo "Downloading noscroll ($REF)…"
+  curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/noscroll" -o "$TMP/noscroll"
+  chmod +x "$TMP/noscroll"
+  SRC="$TMP/noscroll"
 fi
 
-echo "Installing noscroll to $DEST"
-mkdir -p "$PREFIX"
-install -m 755 "$SRC_DIR/noscroll" "$DEST"
-
-if ! command -v noscroll >/dev/null 2>&1; then
-  echo
-  echo "⚠️  $PREFIX is not on your PATH. Add this to your shell profile:"
-  echo "      export PATH=\"$PREFIX:\$PATH\""
-  echo
+# When piped into bash, stdin is this script — prompts need the terminal.
+if [ -t 0 ]; then
+  /bin/bash "$SRC" install
+else
+  /bin/bash "$SRC" install < /dev/tty
 fi
-
-echo "Set a password (needed to stop/uninstall the blocker)…"
-"$DEST" setup-password
-
-echo
-echo "Registering the LaunchAgent…"
-"$DEST" install
-
-echo
-echo "✅ Done. noscroll is running and will block its default sites."
-echo "   Try:  noscroll status"
-echo "         noscroll add reddit.com"
-echo "         noscroll help"

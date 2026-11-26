@@ -1,0 +1,3 @@
+# Intentional patterns: awk program in single quotes, ps|grep for full exec paths,
+# and A && info || info one-liners in doctor output.
+disable=SC2016,SC2009,SC2015

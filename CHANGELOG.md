@@ -4,7 +4,16 @@ All notable changes to noscroll. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [semantic versioning](https://semver.org/).
 
-## [2.2.0] - 2026-11-27
+## [2.2.0] - 2026-11-28
+
+### Added
+- **Downtime:** `noscroll block <site> 22:00-07:00 [days]` blocks on a
+  schedule. Supports overnight windows, `outside 9am-5pm`, several windows,
+  and days (`weekdays`, `weekends`, `mon-fri`, `sat,sun`). It combines with a
+  time limit. Widening a schedule is instant; shrinking one is queued.
+- **App rules:** `app:Discord` works with `block`, downtime and `limit`.
+  Blocked apps are quit; limited apps count time while they're in front.
+- `config interval <1–10s>`. Raising it is queued like any other loosening.
 
 ### Changed
 - **About 7× less CPU** (10.2% → ≈1.5% of one core, measured). A single
@@ -15,9 +24,8 @@ uses [semantic versioning](https://semver.org/).
   switch to a browser.
 - Config is read with shell builtins, the matcher re-runs only when tabs
   change, and full signature checks run only when a state file changes.
-
-### Added
-- `config interval <1–10s>`. Raising it is queued like any other loosening.
+- The monitor checks straight away on any app switch, not just to a browser.
+- `check` lists every rule that hits a URL, and whether its downtime is on.
 
 ### Fixed
 - The daemon silenced its own stderr after the first monitor restart.

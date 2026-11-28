@@ -1,5 +1,5 @@
 #!/bin/bash
-# noscroll — a stubborn website blocker for macOS.
+# noscroll — a stubborn website and app blocker for macOS.
 # https://github.com/ben47203/noscroll · MIT licence
 #
 # Watches Safari and Chromium-based browsers and closes tabs that match your
@@ -457,6 +457,13 @@ store_salted() {   # store_salted FILE VALUE
 normalise_pattern() {
   local p pre="" host
   p="$(lower "$(trim "$1")")"
+  # Apps: matched by their name in /Applications, ignoring case and spaces.
+  if [[ "$p" == app:* ]]; then
+    p="${p#app:}"; p="${p//[[:space:]]/}"; p="${p%.app}"; p="${p##*/}"
+    [ -n "$p" ] || { echo "empty app name — e.g. app:Discord" >&2; return 1; }
+    case "$p" in *[\|\"\\]*) echo "app names can't contain quotes, | or \\" >&2; return 1 ;; esac
+    printf 'app:%s' "$p"; return 0
+  fi
   case "$p" in
     *[[:space:]\|\"\\]*) echo "patterns can't contain spaces, quotes, | or \\" >&2; return 1 ;;
   esac
@@ -481,11 +488,11 @@ normalise_pattern() {
   printf '%s%s' "$pre" "$p"
 }
 
-# parse_line LINE → R_KIND R_TOKEN R_PAT R_HIDDEN R_GRACE R_LIMIT
+# parse_line LINE → R_KIND R_PAT R_HIDDEN R_GRACE R_LIMIT R_DURING
 parse_line() {
   local line tok rest opt v
   line="$(trim "$1")"
-  R_KIND=block; R_PAT=""; R_HIDDEN=0; R_GRACE=0; R_LIMIT=0
+  R_KIND=block; R_PAT=""; R_HIDDEN=0; R_GRACE=0; R_LIMIT=0; R_DURING=""
   [ -z "$line" ] && return 1
   [ "${line:0:1}" = "#" ] && return 1
   if [ "${line:0:1}" = "!" ]; then R_KIND=allow; line="${line:1}"; fi
@@ -503,12 +510,13 @@ parse_line() {
     case "$opt" in
       grace=*) v=$(parse_duration "${opt#grace=}") && R_GRACE=$v ;;
       limit=*) v=$(parse_duration "${opt#limit=}") && R_LIMIT=$v ;;
+      during=*) v="${opt#during=}"; [[ "$v" =~ $NS_SCHED_RE ]] && R_DURING=$v ;;
     esac
   done
   return 0
 }
 
-# compose_line KIND PATTERN HIDE GRACE LIMIT
+# compose_line KIND PATTERN HIDE GRACE LIMIT [DURING]
 compose_line() {
   local tok="$2" l
   [ "$3" = 1 ] && tok="hex:$(hex_encode "$2")"
@@ -516,7 +524,177 @@ compose_line() {
   [ "$1" = allow ] && l="!$l"
   [ "${4:-0}" -gt 0 ] && l="$l grace=$4"
   [ "${5:-0}" -gt 0 ] && l="$l limit=$5"
+  [ -n "$6" ] && l="$l during=$6"
   printf '%s' "$l"
+}
+
+# ───────────────────────────── downtime ──────────────────────────────────
+#
+# A schedule is a comma-separated list of windows "HHMM-HHMM[@days]", days
+# being ISO weekday digits (1 = Monday … 7 = Sunday; all days if omitted).
+# A window that ends before it starts runs past midnight, and belongs to
+# the day it starts on. "2200-0700@12345" = 10pm to 7am, Mon–Fri nights.
+
+NS_SCHED_RE='^[0-9]{4}-[0-9]{4}(@[1-7]+)?(,[0-9]{4}-[0-9]{4}(@[1-7]+)?)*$'
+NS_WINDOW_RE='^[0-9]{1,2}(:?[0-9]{2})?(am|pm)?-[0-9]{1,2}(:?[0-9]{2})?(am|pm)?$'
+
+# parse_clock 22:00 | 2200 | 10pm | 7:30am | 7 → minutes since midnight
+parse_clock() {
+  local t ap="" h m=0
+  t=$(lower "$1")
+  case "$t" in *am) ap=am; t=${t%am} ;; *pm) ap=pm; t=${t%pm} ;; esac
+  [[ "$t" =~ ^([0-9]{1,2}):?([0-9]{2})?$ ]] || return 1
+  h=$((10#${BASH_REMATCH[1]})); [ -n "${BASH_REMATCH[2]}" ] && m=$((10#${BASH_REMATCH[2]}))
+  if [ -n "$ap" ]; then
+    [ "$h" -ge 1 ] && [ "$h" -le 12 ] || return 1
+    h=$((h % 12)); [ "$ap" = pm ] && h=$((h + 12))
+  fi
+  [ "$m" -lt 60 ] && { [ "$h" -lt 24 ] || { [ "$h" = 24 ] && [ "$m" = 0 ]; }; } || return 1
+  echo $((h * 60 + m))
+}
+
+hhmm() { printf '%02d%02d' $(($1 / 60)) $(($1 % 60)); }
+fmt_clock() { local w="$1"; printf '%s:%s' "${w:0:2}" "${w:2:2}"; }
+
+day_num() {
+  case "$1" in
+    mon|monday) echo 1 ;; tue|tues|tuesday) echo 2 ;; wed|wednesday) echo 3 ;;
+    thu|thur|thurs|thursday) echo 4 ;; fri|friday) echo 5 ;;
+    sat|saturday) echo 6 ;; sun|sunday) echo 7 ;; *) return 1 ;;
+  esac
+}
+
+# parse_days weekdays | weekends | daily | mon-fri | mon,wed,fri → digits
+parse_days() {
+  local t part a b out="" d
+  t=$(lower "$1")
+  case "$t" in
+    daily|everyday) echo 1234567; return 0 ;;
+    weekdays) echo 12345; return 0 ;;
+    weekends|weekend) echo 67; return 0 ;;
+  esac
+  for part in ${t//,/ }; do
+    if [[ "$part" == *-* ]]; then
+      a=$(day_num "${part%-*}") && b=$(day_num "${part#*-}") || return 1
+      d=$a
+      while :; do out="$out$d"; [ "$d" = "$b" ] && break; d=$((d % 7 + 1)); done
+    else
+      d=$(day_num "$part") || return 1; out="$out$d"
+    fi
+  done
+  [ -n "$out" ] || return 1
+  printf '%s' "$out" | fold -w1 | sort -u | tr -d '\n'
+}
+
+is_sched_word() {   # does this CLI argument belong to a schedule?
+  local t; t=$(lower "$1")
+  [ "$t" = outside ] && return 0
+  [[ "$t" =~ $NS_WINDOW_RE ]] && return 0
+  parse_days "$t" >/dev/null 2>&1
+}
+
+# parse_sched ARGS… → prints a schedule. "outside A-B" blocks everything
+# but A–B on those days. Days follow the window they apply to.
+parse_sched() {
+  local out="" outside=0 wa="" wb="" wo=0 wd="" t a b d
+  _sched_flush() {
+    [ -n "$wa" ] || return 0
+    local days=""; [ -n "$wd" ] && [ "$wd" != 1234567 ] && days="@$wd"
+    if [ "$wo" = 0 ]; then out="$out,$(hhmm "$wa")-$(hhmm "$wb")$days"
+    elif [ "$wa" -lt "$wb" ]; then
+      [ "$wa" -gt 0 ] && out="$out,0000-$(hhmm "$wa")$days"
+      [ "$wb" -lt 1440 ] && out="$out,$(hhmm "$wb")-2400$days"
+    else out="$out,$(hhmm "$wb")-$(hhmm "$wa")$days"
+    fi
+    wa=""; wd=""
+  }
+  for t in "$@"; do
+    t=$(lower "$t")
+    if [ "$t" = outside ]; then _sched_flush; outside=1
+    elif [[ "$t" =~ $NS_WINDOW_RE ]]; then
+      _sched_flush
+      a=$(parse_clock "${t%-*}") && b=$(parse_clock "${t#*-}") || { echo "bad time in '$t' (try 22:00-07:00 or 10pm-7am)" >&2; return 1; }
+      [ "$a" -lt 1440 ] || { echo "'$t' can't start at 24:00" >&2; return 1; }
+      [ "$a" != "$b" ] || { echo "'$t' starts and ends at the same time" >&2; return 1; }
+      [ "$b" = 0 ] && [ "$outside" = 0 ] && b=1440
+      wa=$a; wb=$b; wo=$outside; outside=0
+    elif d=$(parse_days "$t"); then
+      [ -n "$wa" ] || { echo "put days after the time they apply to, e.g. 22:00-07:00 weekdays" >&2; return 1; }
+      wd="$wd$d"; wd=$(printf '%s' "$wd" | fold -w1 | sort -u | tr -d '\n')
+    else echo "don't understand '$t'" >&2; return 1
+    fi
+  done
+  [ "$outside" = 0 ] || { echo "'outside' needs a time after it, e.g. outside 9am-5pm" >&2; return 1; }
+  _sched_flush
+  out="${out#,}"
+  [[ "$out" =~ $NS_SCHED_RE ]] || { echo "no time given (try 22:00-07:00)" >&2; return 1; }
+  printf '%s' "$out"
+}
+
+# sched_active SCHED DOW MINUTE → success if the schedule covers that minute.
+sched_active() {
+  local w d a b prev=$(( $2 == 1 ? 7 : $2 - 1 ))
+  for w in ${1//,/ }; do
+    d=1234567; case "$w" in *@*) d=${w#*@}; w=${w%@*} ;; esac
+    a=${w%-*}; b=${w#*-}
+    a=$((10#${a:0:2} * 60 + 10#${a:2:2})); b=$((10#${b:0:2} * 60 + 10#${b:2:2}))
+    if [ "$a" -lt "$b" ]; then
+      [[ "$d" == *"$2"* ]] && [ "$3" -ge "$a" ] && [ "$3" -lt "$b" ] && return 0
+    else
+      [[ "$d" == *"$2"* ]] && [ "$3" -ge "$a" ] && return 0
+      [[ "$d" == *"$prev"* ]] && [ "$3" -lt "$b" ] && return 0
+    fi
+  done
+  return 1
+}
+
+# Local weekday (1–7) and minute of day, now.
+now_local() { NOW_DOW=$(date +%u); NOW_MIN=$(( 10#$(date +%H) * 60 + 10#$(date +%M) )); }
+
+# sched_covers NEW OLD → success if NEW blocks at least every minute OLD
+# does. "ALL" = the whole week.
+sched_covers() {
+  awk -v n="$1" -v o="$2" '
+  function fill(s, arr,    ws, nw, k, w, d, p, a, b, e, i, m, day) {
+    if (s == "ALL") { for (i = 0; i < 10080; i++) arr[i] = 1; return }
+    nw = split(s, ws, ",")
+    for (k = 1; k <= nw; k++) {
+      w = ws[k]; d = "1234567"; p = index(w, "@")
+      if (p) { d = substr(w, p + 1); w = substr(w, 1, p - 1) }
+      a = substr(w, 1, 2) * 60 + substr(w, 3, 2); b = substr(w, 6, 2) * 60 + substr(w, 8, 2)
+      e = (a < b) ? b : b + 1440
+      for (i = 1; i <= length(d); i++) {
+        day = substr(d, i, 1) - 1
+        for (m = a; m < e; m++) arr[(day * 1440 + m) % 10080] = 1
+      }
+    }
+  }
+  BEGIN { fill(n, N); fill(o, O); for (i in O) if (!(i in N)) exit 1; exit 0 }'
+}
+
+days_label() {
+  case "$1" in
+    ""|1234567) return 0 ;; 12345) printf ' weekdays' ;; 67) printf ' weekends' ;;
+    *) local i out="" n; for ((i = 0; i < ${#1}; i++)); do
+         n=${1:i:1}; out="$out,$(echo "Mon Tue Wed Thu Fri Sat Sun" | cut -d' ' -f"$n")"; done
+       printf ' %s' "${out#,}" ;;
+  esac
+}
+
+# Human form: "22:00–07:00 weekdays", "outside 09:00–17:00".
+sched_fmt() {
+  local s="$1" out="" w d rest
+  # Fold the pair "outside" produces back into one phrase.
+  if [[ "$s" =~ ^0000-([0-9]{4})(@[1-7]+)?,([0-9]{4})-2400(@[1-7]+)?$ ]] && [ "${BASH_REMATCH[2]}" = "${BASH_REMATCH[4]}" ]; then
+    printf 'outside %s–%s%s' "$(fmt_clock "${BASH_REMATCH[1]}")" "$(fmt_clock "${BASH_REMATCH[3]}")" "$(days_label "${BASH_REMATCH[2]#@}")"
+    return 0
+  fi
+  for w in ${s//,/ }; do
+    d=""; case "$w" in *@*) d=${w#*@}; w=${w%@*} ;; esac
+    rest="$(fmt_clock "${w%-*}")–$(fmt_clock "${w#*-}")$(days_label "$d")"
+    out="$out, $rest"
+  done
+  printf '%s' "${out#, }"
 }
 
 # pattern_split PATTERN → P_TYPE (kw|exact|sub|dom) P_HOST P_PATH
@@ -541,9 +719,22 @@ rule_label() {   # uses R_* from parse_line; $1=1 to reveal hidden
 rule_opts() {
   local o=""
   [ "$R_LIMIT" -gt 0 ] && o="$(fmt_duration "$R_LIMIT")/day"
+  [ -n "$R_DURING" ] && o="${o:+$o; }blocked $(sched_fmt "$R_DURING")"
   [ "$R_GRACE" -gt 0 ] && o="${o:+$o, }after $(fmt_duration "$R_GRACE")"
   printf '%s' "$o"
 }
+
+# What a rule does (from parse_line's R_*). A block line with neither a
+# limit nor a schedule blocks all the time.
+rule_always() { [ "$R_KIND" = block ] && [ "$R_LIMIT" = 0 ] && [ -z "$R_DURING" ]; }
+rule_type() {
+  if [ "$R_KIND" = allow ]; then echo allow
+  elif [ "$R_LIMIT" -gt 0 ]; then echo limit
+  elif [ -n "$R_DURING" ]; then echo downtime
+  else echo block; fi
+}
+rule_sched() { if rule_always; then echo ALL; else printf '%s' "$R_DURING"; fi; }
+rule_cap()   { if rule_always; then echo 0; elif [ "$R_LIMIT" -gt 0 ]; then echo "$R_LIMIT"; else echo 999999999; fi; }
 
 rules_body() { sbody "$F_SITES"; }
 
@@ -602,15 +793,22 @@ rule_at() {
   return 1
 }
 
-# A change is weaker if it adds/raises a time limit or adds/raises a grace.
-is_weaker() {   # OLD_GRACE OLD_LIMIT NEW_GRACE NEW_LIMIT
-  if [ "$4" -gt 0 ] && { [ "$2" -eq 0 ] || [ "$4" -gt "$2" ]; }; then return 0; fi
-  [ "$3" -gt "$1" ]
+# A change is weaker if it allows more daily time, a longer grace, or
+# blocks during fewer minutes of the week than the rule it replaces.
+is_weaker() {   # OLD_LINE NEW_LINE
+  local og oc os
+  parse_line "$1"; og=$R_GRACE; oc=$(rule_cap); os=$(rule_sched)
+  parse_line "$2"
+  [ "$R_GRACE" -gt "$og" ] && return 0
+  [ "$(rule_cap)" -gt "$oc" ] && return 0
+  sched_covers "$(rule_sched)" "$os" && return 1
+  return 0
 }
 
 # The awk matcher. Input 1: rules TSV (idx kind type host path).
 # Input 2: tabs TSV (app wid tab active url). Output: idx + tab line for
-# every tab hit by a block rule and not rescued by an allow rule.
+# every tab hit by a block rule and not rescued by an allow rule; idx is a
+# comma list of every block rule it hits (the daemon decides which apply now).
 NS_MATCHER='
 function endswith(s, t) { return length(s) >= length(t) && substr(s, length(s) - length(t) + 1) == t }
 function hit(i,    hh, pp, L, c) {
@@ -638,13 +836,13 @@ FNR == NR { n++; idx[n] = $1; kind[n] = $2; typ[n] = $3; host[n] = $4; path[n] =
   if (substr(pth, 1, 1) != "/") pth = "/" pth
   at = index(h, "@"); if (at > 0) h = substr(h, at + 1)
   sub(/:[0-9]+$/, "", h); sub(/\.$/, "", h)
-  blk = 0; alw = 0
+  blk = ""; alw = 0
   for (i = 1; i <= n; i++) {
     if (!hit(i)) continue
     if (kind[i] == "allow") { alw = 1; break }
-    if (!blk) blk = i
+    blk = blk (blk == "" ? "" : ",") idx[i]
   }
-  if (blk && !alw) print idx[blk] "\t" $0
+  if (blk != "" && !alw) print blk "\t" $0
 }'
 
 # Build the matcher's rule table from the sites file.
@@ -654,12 +852,13 @@ write_rules_tsv() {   # $1 = output file
   while IFS= read -r line; do
     parse_line "$line" || continue
     i=$((i + 1))
+    [[ "$R_PAT" == app:* ]] && continue   # apps aren't URLs
     pattern_split "$R_PAT"
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$R_KIND" "$P_TYPE" "$P_HOST" "$P_PATH" >> "$1"
   done < <(rules_body)
 }
 
-# match_url URL → prints the index of the block rule that would close it.
+# match_url URL → prints the indexes (comma list) of block rules it hits.
 match_url() {
   local tmp="$NS_HOME/.check.$$"
   write_rules_tsv "$tmp.rules"
@@ -720,7 +919,9 @@ EOF
 # it fetches every window's URLs in three Apple Events per browser.
 #
 # Output per check: "app wid tab active url" lines, "OK<TAB>app" or
-# "ERR<TAB>app<TAB>message", then "TICK<TAB>frontmost-bundle-id<TAB>any".
+# "ERR<TAB>app<TAB>message", then
+# "TICK<TAB>frontmost-bundle-id<TAB>any-browser-running<TAB>frontmost-app-key"
+# (the app key is its .app name, lower case, no spaces: for app rules).
 read -r -d '' NS_MONITOR_JS <<'JS'
 function run(argv) {
   ObjC.import('AppKit');
@@ -731,9 +932,13 @@ function run(argv) {
   var isBrowser = {}; specs.forEach(function (sp) { isBrowser[sp.bid] = true; });
   var out = $.NSFileHandle.fileHandleWithStandardOutput, ws = $.NSWorkspace.sharedWorkspace;
   function emit(s) { out.writeData($(s + '\n').dataUsingEncoding($.NSUTF8StringEncoding)); }
+  var frontKey = '';
   function front() {
     var f = ws.frontmostApplication;
-    if (f && !f.isNil() && f.bundleIdentifier && !f.bundleIdentifier.isNil()) return ObjC.unwrap(f.bundleIdentifier);
+    frontKey = '';
+    if (!f || f.isNil()) return '';
+    try { frontKey = ObjC.unwrap(f.bundleURL.lastPathComponent).replace(/\.app$/i, '').replace(/\s+/g, '').toLowerCase(); } catch (e) {}
+    if (f.bundleIdentifier && !f.bundleIdentifier.isNil()) return ObjC.unwrap(f.bundleIdentifier);
     return '';
   }
   function check(fb) {
@@ -765,16 +970,17 @@ function run(argv) {
         lines.push('ERR\t' + sp.name + '\t' + String(e).replace(/\s+/g, ' '));
       }
     });
-    lines.push('TICK\t' + fb + '\t' + any);
+    lines.push('TICK\t' + fb + '\t' + any + '\t' + frontKey);
     emit(lines.join('\n'));
   }
   // Glance at the frontmost app twice a second (nearly free). Do a full
   // check every interval while a browser is in front, every 4× interval
-  // otherwise, and straight away when you switch to a browser.
+  // otherwise, and straight away whenever you switch apps (so a blocked
+  // app or site is caught as soon as it comes to the front).
   var last = -1e9, lastFront = null, done = 0;
   while (done < iters) {
     var fb = front(), now = Date.now() / 1000, due = isBrowser[fb] ? interval : interval * 4;
-    if (fb !== lastFront && isBrowser[fb]) due = 0;
+    if (fb !== lastFront) due = 0;
     lastFront = fb;
     if (now - last >= due) { check(fb); last = now; done++; }
     if (done < iters) delay(Math.min(0.5, interval));
@@ -809,7 +1015,8 @@ monitor_read() {
     case "$line" in
       TICK$'\t'*)
         line=${line#TICK$'\t'}
-        MON_FRONT=${line%%$'\t'*}; NS_ANY_BROWSER=${line##*$'\t'}
+        MON_FRONT=${line%%$'\t'*}; line=${line#*$'\t'}
+        NS_ANY_BROWSER=${line%%$'\t'*}; MON_FRONT_KEY=${line#*$'\t'}
         return 0 ;;
       OK$'\t'*) BROWSER_STATUS="$BROWSER_STATUS${line#OK$'\t'}=ok;" ;;
       ERR$'\t'*)
@@ -948,6 +1155,54 @@ quit_unsupported() {
         } ;;
     esac
   done <<< "$APPS"
+}
+
+# Without the monitor: the frontmost app's key, as the monitor reports it.
+front_app_key() {
+  local p
+  p=$(lsappinfo info -only bundlepath "$(lsappinfo front 2>/dev/null)" 2>/dev/null)
+  p=${p#*=\"}; p=${p%\"*}; p=${p##*/}; p=${p%.app}
+  lower "${p//[[:space:]]/}"
+}
+
+# App rules. Each running .app's main executable is matched by its bundle
+# name; helpers ("Discord Helper (Renderer)") don't match, but quitting the
+# main process takes them with it.
+LAST_APP_NOTIFY=0
+enforce_apps() {   # uses RULE_* and MON_FRONT_KEY; marks R_ACTIVE for app limits
+  local i want="" front_blocked=0 pid key why
+  for ((i = 1; i <= RULE_COUNT; i++)); do
+    [ -n "${RULE_APP[i]}" ] || continue
+    if [ "${RULE_ALWAYS[i]}" = 1 ] || [ "${RULE_ON[i]}" = 1 ] ||
+       { [ "${RULE_LIMIT[i]}" -gt 0 ] && [ "${USED[i]}" -ge "${RULE_LIMIT[i]}" ]; }; then
+      want="$want ${RULE_APP[i]}"
+      [ "$MON_FRONT_KEY" = "${RULE_APP[i]}" ] && front_blocked=1
+    elif [ "${RULE_LIMIT[i]}" -gt 0 ] && [ "$MON_FRONT_KEY" = "${RULE_APP[i]}" ]; then
+      R_ACTIVE[i]=1
+    fi
+  done
+  [ -n "$want" ] || return 0
+  # A blocked app in front is closed now; one in the background within two checks.
+  [ "$front_blocked" = 1 ] || [ $((TICK % 2)) -eq 0 ] || return 0
+  while IFS=$'\t' read -r pid key; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || continue
+    for ((i = 1; i <= RULE_COUNT; i++)); do [ "${RULE_APP[i]}" = "$key" ] && why=${RULE_LABEL[i]}; done
+    log "app: quit $key"
+    if [ $((NOW - LAST_APP_NOTIFY)) -ge 30 ]; then
+      LAST_APP_NOTIFY=$NOW
+      if [ "$CFGV_discreet" = 1 ]; then notify "Closed a blocked app."; else notify "Closed ${why#app:}."; fi
+    fi
+  done < <(pgrep -lf '\.app/Contents/MacOS/' 2>/dev/null | awk -v want="$want" '
+    BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) W[w[i]] = 1 }
+    {
+      pid = $1; s = substr($0, length($1) + 2); mark = ".app/Contents/MacOS/"; last = 0; off = 0
+      while ((p = index(substr(s, off + 1), mark)) > 0) { last = off + p; off = last }
+      if (!last) next
+      name = substr(s, 1, last - 1); sub(/.*\//, "", name)
+      key = tolower(name); gsub(/[ \t]/, "", key)
+      if (key in W) print pid "\t" key
+    }')
 }
 
 LAST_NOTIFY=0
@@ -1349,12 +1604,29 @@ daemon_loop() {
   done
 }
 
-# Wall-clock seconds without spawning `date` every tick.
+# Wall-clock seconds without spawning `date` every tick. Re-synced at
+# midnight, every local half hour (DST, time-zone changes) and every 300 ticks.
 clock_sync() {
-  local d; d=$(date '+%s %F')
-  NS_T0=$(( ${d%% *} - SECONDS )); TODAY=${d#* }
-  NEXT_MIDNIGHT=$(date -j -v+1d -v0H -v0M -v0S '+%s' 2>/dev/null || echo $(( ${d%% *} + 3600 )))
-  NOW=${d%% *}
+  local d z s next; d=$(date '+%s %F %z')
+  NOW=${d%% *}; d=${d#* }; TODAY=${d%% *}; z=${d#* }
+  NS_T0=$(( NOW - SECONDS ))
+  s=$(( 10#${z:1:2} * 3600 + 10#${z:3:2} * 60 )); [ "${z:0:1}" = - ] && s=$((-s))
+  TZOFF=$s
+  NEXT_MIDNIGHT=$(date -j -v+1d -v0H -v0M -v0S '+%s' 2>/dev/null || echo $(( NOW + 3600 )))
+  next=$(( NOW + 1800 - (NOW + TZOFF) % 1800 ))
+  [ "$next" -lt "$NEXT_MIDNIGHT" ] && NEXT_MIDNIGHT=$next
+  SCHED_KEY=""
+}
+
+# Recompute which downtime windows are on, once a minute.
+update_schedule() {
+  local lm=$(( (NOW + TZOFF) / 60 )) i dow min
+  [ "$lm" = "$SCHED_KEY" ] && return 0
+  SCHED_KEY=$lm; min=$(( lm % 1440 )); dow=$(( (lm / 1440 + 3) % 7 + 1 ))
+  for ((i = 1; i <= RULE_COUNT; i++)); do
+    RULE_ON[i]=0
+    [ -n "${RULE_SCHED[i]}" ] && sched_active "${RULE_SCHED[i]}" "$dow" "$min" && RULE_ON[i]=1
+  done
 }
 
 maybe_reload_rules() {
@@ -1363,6 +1635,7 @@ maybe_reload_rules() {
   [ -n "$USAGE_DATE" ] && persist_usage
   RULES_SIG=$sig
   RULE_COUNT=0; RULE_LIMIT=(); RULE_GRACE=(); RULE_KEY=(); RULE_LABEL=()
+  RULE_SCHED=(); RULE_ALWAYS=(); RULE_APP=(); RULE_ON=(); HAS_APPS=0; HAS_SCHED=0
   FIRST_SEEN=(); USED=(); WARNED=(); R_SEEN=(); R_ACTIVE=()
   local line i
   while IFS= read -r line; do
@@ -1371,10 +1644,14 @@ maybe_reload_rules() {
     RULE_LIMIT[i]=$R_LIMIT; RULE_GRACE[i]=$R_GRACE
     RULE_KEY[i]=$(hex_encode "$R_KIND:$R_PAT")
     RULE_LABEL[i]=$(rule_label)
+    RULE_SCHED[i]=$R_DURING; RULE_ON[i]=0; RULE_ALWAYS[i]=0; RULE_APP[i]=""
+    rule_always && RULE_ALWAYS[i]=1
+    [ -n "$R_DURING" ] && HAS_SCHED=1
+    [[ "$R_PAT" == app:* ]] && [ "$R_KIND" = block ] && { RULE_APP[i]=${R_PAT#app:}; HAS_APPS=1; }
     FIRST_SEEN[i]=0; USED[i]=0; WARNED[i]=0
   done < <(rules_body)
   write_rules_tsv "$F_RULES_TSV"
-  USAGE_DATE=""; LAST_TABS="-"
+  USAGE_DATE=""; LAST_TABS="-"; SCHED_KEY=""
 }
 
 load_usage() {   # DATE
@@ -1423,7 +1700,7 @@ queue_close() {   # APP WID TAB URL IDX
 tick() {
   local t today dt i idx app wid ti act url front_app="" front_done=0 fp
   NOW=$((NS_T0 + SECONDS))
-  if [ "$NOW" -ge "$NEXT_MIDNIGHT" ] || [ $((TICK % 300)) -eq 0 ]; then clock_sync; fi
+  if [ "$NOW" -ge "$NEXT_MIDNIGHT" ] || [ $((TICK % 300)) -eq 0 ]; then clock_sync; NOW=$((NS_T0 + SECONDS)); fi
   t=$NOW; today=$TODAY
   dt=$((t - LAST_TICK)); LAST_TICK=$t
   # Don't count time across sleep/suspend.
@@ -1459,38 +1736,48 @@ tick() {
     scan_apps
     snapshot_tabs
     TABS=$(cat "$F_TABS")
-  fi
-  [ "$NS_ANY_BROWSER" = 1 ] || { write_state "$t"; return 0; }
-
-  # Tabs rarely change between checks: only re-run the matcher when they do.
-  if [ "$TABS" != "$LAST_TABS" ]; then
-    printf '%s' "$TABS" > "$F_TABS"
-    MATCH_OUT=$(awk "$NS_MATCHER" "$F_RULES_TSV" "$F_TABS")
-    LAST_TABS=$TABS
+    [ "$HAS_APPS" = 1 ] && MON_FRONT_KEY=$(front_app_key)
   fi
 
   for ((i = 1; i <= RULE_COUNT; i++)); do R_SEEN[i]=0; R_ACTIVE[i]=0; done
+  [ "$HAS_SCHED" = 1 ] && update_schedule
+  [ "$HAS_APPS" = 1 ] && enforce_apps
+
   CLOSE_SPECS=""; CLOSED_LABEL=""
-  while IFS=$'\t' read -r idx app wid ti act url; do
-    [ -z "$idx" ] && continue
-    if [ "${RULE_LIMIT[idx]}" -gt 0 ]; then
-      if [ "${USED[idx]}" -ge "${RULE_LIMIT[idx]}" ]; then
-        queue_close "$app" "$wid" "$ti" "$url" "$idx"
-      elif [ "$act" = 1 ]; then
-        [ "$front_done" = 1 ] || { front_app=$(front_app_name); front_done=1; }
-        [ "$app" = "$front_app" ] && R_ACTIVE[idx]=1
-      fi
-    elif [ "${RULE_GRACE[idx]}" -gt 0 ]; then
-      R_SEEN[idx]=1
-      if [ "${FIRST_SEEN[idx]}" -eq 0 ]; then
-        FIRST_SEEN[idx]=$t
-      elif [ $((t - FIRST_SEEN[idx])) -ge "${RULE_GRACE[idx]}" ]; then
-        queue_close "$app" "$wid" "$ti" "$url" "$idx"
-      fi
-    else
-      queue_close "$app" "$wid" "$ti" "$url" "$idx"
+  if [ "$NS_ANY_BROWSER" = 1 ]; then
+    # Tabs rarely change between checks: only re-run the matcher when they do.
+    if [ "$TABS" != "$LAST_TABS" ]; then
+      printf '%s' "$TABS" > "$F_TABS"
+      MATCH_OUT=$(awk "$NS_MATCHER" "$F_RULES_TSV" "$F_TABS")
+      LAST_TABS=$TABS
     fi
-  done <<< "$MATCH_OUT"
+
+    local idxs close
+    while IFS=$'\t' read -r idxs app wid ti act url; do
+      [ -z "$idxs" ] && continue
+      close=""
+      for idx in ${idxs//,/ }; do
+        if [ "${RULE_ALWAYS[idx]}" = 1 ] || [ "${RULE_ON[idx]}" = 1 ]; then
+          if [ "${RULE_GRACE[idx]}" -gt 0 ]; then
+            R_SEEN[idx]=1
+            if [ "${FIRST_SEEN[idx]}" -eq 0 ]; then FIRST_SEEN[idx]=$t
+            elif [ $((t - FIRST_SEEN[idx])) -ge "${RULE_GRACE[idx]}" ]; then close=$idx; fi
+          else
+            close=$idx
+          fi
+        elif [ "${RULE_LIMIT[idx]}" -gt 0 ]; then
+          if [ "${USED[idx]}" -ge "${RULE_LIMIT[idx]}" ]; then
+            close=$idx
+          elif [ "$act" = 1 ]; then
+            [ "$front_done" = 1 ] || { front_app=$(front_app_name); front_done=1; }
+            [ "$app" = "$front_app" ] && R_ACTIVE[idx]=1
+          fi
+        fi
+        [ -n "$close" ] && break
+      done
+      [ -n "$close" ] && queue_close "$app" "$wid" "$ti" "$url" "$close"
+    done <<< "$MATCH_OUT"
+  fi
 
   local left
   for ((i = 1; i <= RULE_COUNT; i++)); do
@@ -1571,10 +1858,13 @@ ns_init() {
 # OPT_INDEX ("#n" references) and OPT_GRACE. Under `noscroll hex …`
 # (NS_HEX=1) sites are given hex-encoded; with none given, prompt (hidden).
 collect_patterns() {
-  PATTERNS=""; OPT_GRACE=0; OPT_INDEX=""
-  local a p v
+  PATTERNS=""; OPT_GRACE=0; OPT_INDEX=""; OPT_SCHED=""
+  local a p v sched_args=()
   while [ $# -gt 0 ]; do
     a="$1"; shift
+    if [[ "$a" != *.* && "$a" != app:* && "$a" != "~"* && "$a" != -* ]] && is_sched_word "$a"; then
+      sched_args+=("$a"); continue
+    fi
     case "$a" in
       --grace) v=$(parse_duration "$1") || die "bad duration '$1' (try 90s, 5m, 1h)"; OPT_GRACE=$v; shift ;;
       \#[0-9]*) OPT_INDEX="$OPT_INDEX ${a#\#}" ;;
@@ -1588,6 +1878,9 @@ collect_patterns() {
         PATTERNS="$PATTERNS$p"$'\n' ;;
     esac
   done
+  if [ ${#sched_args[@]} -gt 0 ]; then
+    OPT_SCHED=$(parse_sched "${sched_args[@]}") || exit 1
+  fi
   if [ "$NS_HEX" = 1 ] && [ -z "$PATTERNS" ] && [ -z "$OPT_INDEX" ]; then
     read_secret "Site (input hidden): " v
     p=$(normalise_pattern "$v") || exit 1
@@ -1598,27 +1891,26 @@ collect_patterns() {
 # Store hex-encoded? Yes under `noscroll hex …` or in discreet mode.
 want_hidden() { [ "$NS_HEX" = 1 ] || [ "$(cfg discreet)" = 1 ]; }
 
-# Set the rule for a site; tightening applies now, loosening is queued.
-set_rule() {   # PATTERN HIDE GRACE LIMIT [import]
-  local pat="$1" hide="$2" g="$3" l="$4" old new label what
-  new=$(compose_line block "$pat" "$hide" "$g" "$l")
-  parse_line "$new"; label=$(rule_label)
-  if [ "$l" -gt 0 ]; then what="Limited $label to $(fmt_duration "$l")/day"; else what="Blocked $label"; fi
+# Set a site's (or app's) block line; tightening applies now, loosening is
+# queued. WHAT describes the change ("Blocked reddit.com").
+set_rule() {   # NEWLINE WHAT [import]
+  local new="$1" what="$2" old label pat hide
+  parse_line "$new"; label=$(rule_label); pat=$R_PAT; hide=$R_HIDDEN
   if ! old=$(find_rule block "$pat"); then
     rules_upsert "$new"; info "$what."
     return 0
   fi
   parse_line "$old"
-  local og=$R_GRACE ol=$R_LIMIT
-  [ "$hide" = 0 ] && [ "$R_HIDDEN" = 1 ] && new=$(compose_line block "$pat" 1 "$g" "$l")
-  if [ "$og" = "$g" ] && [ "$ol" = "$l" ]; then
+  if [ "$hide" = 0 ] && [ "$R_HIDDEN" = 1 ]; then   # never un-hide by accident
+    parse_line "$new"; new=$(compose_line block "$pat" 1 "$R_GRACE" "$R_LIMIT" "$R_DURING")
+  fi
+  if [ "${old#* }" = "${new#* }" ] || { [[ "$old" != *" "* ]] && [[ "$new" != *" "* ]]; }; then
     if [ "$old" != "$new" ]; then rules_upsert "$new"; info "Updated $label."
-    elif [ "$l" -gt 0 ]; then info "$label is already limited to $(fmt_duration "$l")/day."
-    else info "$label is already blocked."; fi
+    else info "$label already has that rule."; fi
     return 0
   fi
-  if is_weaker "$og" "$ol" "$g" "$l"; then
-    [ -n "$5" ] && { info "Skipped $label (would loosen an existing rule)."; return 0; }
+  if is_weaker "$old" "$new"; then
+    [ -n "$3" ] && { info "Skipped $label (would loosen an existing rule)."; return 0; }
     authorise "loosen the rule for $label"
     queue_action upsert "$new" "$what (loosens the current rule)"
   else
@@ -1626,20 +1918,39 @@ set_rule() {   # PATTERN HIDE GRACE LIMIT [import]
   fi
 }
 
+# The existing block line for PATTERN, parsed into O_* (zeros if none).
+old_rule() {
+  local line
+  O_LIMIT=0; O_GRACE=0; O_DURING=""
+  line=$(find_rule block "$1") || return 0
+  parse_line "$line"; O_LIMIT=$R_LIMIT; O_GRACE=$R_GRACE; O_DURING=$R_DURING
+}
+
+# block SITE…                → blocked all the time
+# block SITE… 22:00-07:00 …  → downtime: blocked on that schedule (keeps any limit)
 cmd_block() {
   ns_init
   collect_patterns "$@"
-  [ -n "$PATTERNS" ] || die "usage: noscroll block <site>… [--grace 60s]"
-  local hide=0 pat
+  [ -n "$PATTERNS" ] || die "usage: noscroll block <site|app:Name>… [<from>-<to> [days]] [--grace 60s]"
+  local hide=0 pat line label
   want_hidden && hide=1
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
-    set_rule "$pat" "$hide" "$OPT_GRACE" 0
+    if [ -n "$OPT_SCHED" ]; then
+      old_rule "$pat"
+      line=$(compose_line block "$pat" "$hide" "$OPT_GRACE" "$O_LIMIT" "$OPT_SCHED")
+      parse_line "$line"; label=$(rule_label)
+      set_rule "$line" "Downtime for $label: blocked $(sched_fmt "$OPT_SCHED")"
+    else
+      line=$(compose_line block "$pat" "$hide" "$OPT_GRACE" 0)
+      parse_line "$line"; label=$(rule_label)
+      set_rule "$line" "Blocked $label"
+    fi
   done <<< "$PATTERNS"
 }
 
 cmd_limit() {
-  local usage="usage: noscroll limit <site>… <duration>   e.g. noscroll limit youtube.com 30m"
+  local usage="usage: noscroll limit <site|app:Name>… <duration>   e.g. noscroll limit youtube.com 30m"
   [ $# -ge 1 ] || die "$usage"
   local d="${!#}" l
   l=$(parse_duration "$d") || die "$usage"
@@ -1647,11 +1958,16 @@ cmd_limit() {
   ns_init
   collect_patterns "${@:1:$#-1}"
   [ -n "$PATTERNS" ] || die "$usage"
-  local hide=0 pat
+  [ -z "$OPT_SCHED" ] || die "a limit doesn't take times — for downtime: noscroll block <site> 22:00-07:00"
+  local hide=0 pat line label
   want_hidden && hide=1
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
-    set_rule "$pat" "$hide" 0 "$l"
+    old_rule "$pat"
+    if [ -n "$O_DURING" ]; then line=$(compose_line block "$pat" "$hide" "$O_GRACE" "$l" "$O_DURING")
+    else line=$(compose_line block "$pat" "$hide" 0 "$l"); fi
+    parse_line "$line"; label=$(rule_label)
+    set_rule "$line" "Limited $label to $(fmt_duration "$l")/day"
   done <<< "$PATTERNS"
 }
 
@@ -1659,6 +1975,8 @@ cmd_allow() {
   ns_init
   collect_patterns "$@"
   [ -n "$PATTERNS" ] || die "usage: noscroll allow <site>…   e.g. noscroll allow reddit.com/r/swift"
+  [ -z "$OPT_SCHED" ] || die "allow rules don't take times"
+  case $'\n'"$PATTERNS" in *$'\n'app:*) die "allow is for sites inside a blocked site — apps are just blocked or not" ;; esac
   local hide=0 pat line label
   want_hidden && hide=1
   while IFS= read -r pat; do
@@ -1672,28 +1990,37 @@ cmd_allow() {
 }
 
 # resolve_targets TYPE — TYPE is block|limit|allow. Prints matching rule
-# lines for PATTERNS/OPT_INDEX; explains mismatches on stderr.
-rule_type() { if [ "$R_KIND" = allow ]; then echo allow; elif [ "$R_LIMIT" -gt 0 ]; then echo limit; else echo block; fi; }
+# lines for PATTERNS/OPT_INDEX; explains mismatches on stderr. A rule can be
+# both limited and on a downtime schedule: unblock drops the schedule,
+# unlimit the limit.
+rule_has() {   # block|limit|allow (uses R_*)
+  case "$1" in
+    allow) [ "$R_KIND" = allow ] ;;
+    limit) [ "$R_KIND" = block ] && [ "$R_LIMIT" -gt 0 ] ;;
+    block) rule_always || { [ "$R_KIND" = block ] && [ -n "$R_DURING" ]; } ;;
+  esac
+}
 resolve_targets() {
-  local want="$1" pat line n t
+  local want="$1" pat line n
   for n in $OPT_INDEX; do
     line=$(rule_at "$n") || { warn "no rule #$n (see: noscroll list)"; continue; }
-    parse_line "$line"; t=$(rule_type)
-    if [ "$t" = "$want" ]; then printf '%s\n' "$line"; else hint_type "#$n" "$t"; fi
+    parse_line "$line"
+    if rule_has "$want"; then printf '%s\n' "$line"; else hint_type "#$n" "$(rule_type)"; fi
   done
   while IFS= read -r pat; do
     [ -z "$pat" ] && continue
     if [ "$want" = allow ]; then line=$(find_rule allow "$pat"); else line=$(find_rule block "$pat"); fi || {
       warn "$pat isn't $( [ "$want" = allow ] && echo allowed || echo "in the list")."; continue; }
-    parse_line "$line"; t=$(rule_type)
-    if [ "$t" = "$want" ]; then printf '%s\n' "$line"; else hint_type "$pat" "$t"; fi
+    parse_line "$line"
+    if rule_has "$want"; then printf '%s\n' "$line"; else hint_type "$pat" "$(rule_type)"; fi
   done <<< "$PATTERNS"
 }
 hint_type() {
   case "$2" in
-    block) warn "$1 is blocked, not limited — use: noscroll unblock $1" ;;
-    limit) warn "$1 is time-limited, not blocked — use: noscroll unlimit $1" ;;
-    allow) warn "$1 is an allow rule — use: noscroll disallow $1" ;;
+    block)    warn "$1 is blocked, not limited — use: noscroll unblock $1" ;;
+    downtime) warn "$1 has downtime, not a limit — use: noscroll unblock $1" ;;
+    limit)    warn "$1 is time-limited, not blocked — use: noscroll unlimit $1" ;;
+    allow)    warn "$1 is an allow rule — use: noscroll disallow $1" ;;
   esac
 }
 
@@ -1704,7 +2031,8 @@ cmd_unrestrict() {   # block|limit|allow ARGS…
   collect_patterns "$@"
   local verb; case "$want" in block) verb=unblock ;; limit) verb=unlimit ;; allow) verb=disallow ;; esac
   [ -n "$PATTERNS$OPT_INDEX" ] || die "usage: noscroll $verb <site>… | '#<n>'"
-  local targets line label authed=0
+  [ -z "$OPT_SCHED" ] || die "$verb doesn't take times — it removes the whole rule (to change downtime, run block again with the new times)"
+  local targets line label authed=0 rest
   targets=$(resolve_targets "$want")
   [ -n "$targets" ] || exit 1
   while IFS= read -r line; do
@@ -1715,7 +2043,15 @@ cmd_unrestrict() {   # block|limit|allow ARGS…
       continue
     fi
     [ "$authed" = 1 ] || { authorise "$verb"; authed=1; }
-    if [ "$want" = limit ]; then queue_action remove "$line" "Remove the time limit on $label"
+    if [ "$want" = limit ]; then
+      if [ -n "$R_DURING" ]; then
+        rest=$(compose_line block "$R_PAT" "$R_HIDDEN" "$R_GRACE" 0 "$R_DURING")
+        queue_action upsert "$rest" "Remove the time limit on $label (keeps its downtime)"
+      else queue_action remove "$line" "Remove the time limit on $label"; fi
+    elif [ -n "$R_DURING" ] && [ "$R_LIMIT" -gt 0 ]; then
+      rest=$(compose_line block "$R_PAT" "$R_HIDDEN" 0 "$R_LIMIT")
+      queue_action upsert "$rest" "Remove downtime on $label (keeps its time limit)"
+    elif [ -n "$R_DURING" ]; then queue_action remove "$line" "Remove downtime on $label"
     else queue_action remove "$line" "Unblock $label"; fi
   done <<< "$targets"
 }
@@ -1736,7 +2072,7 @@ cmd_hide() {   # hide|unhide  all|#n|site
       for a in "$@"; do [ "$a" = all ] || [ "$a" = "#$n" ] && sel=1; done
       printf '%s' "$pat" | grep -qxF "$R_PAT" && sel=1
       if [ "$sel" = 1 ] && [ "$R_HIDDEN" != "$want" ]; then
-        line=$(compose_line "$R_KIND" "$R_PAT" "$want" "$R_GRACE" "$R_LIMIT"); changed=$((changed + 1))
+        line=$(compose_line "$R_KIND" "$R_PAT" "$want" "$R_GRACE" "$R_LIMIT" "$R_DURING"); changed=$((changed + 1))
       fi
     fi
     body="$body$line"$'\n'
@@ -1752,13 +2088,13 @@ cmd_list() {
   for a in "$@"; do case "$a" in --reveal|-r) reveal=1 ;; --raw) raw=1 ;; esac; done
   if [ "$raw" = 1 ]; then rules_body; return 0; fi
   local line n=0 site kind
-  printf '  %-4s %-36s %-6s %s\n' "#" "SITE" "TYPE" "RULE"
+  printf '  %-4s %-36s %-8s %s\n' "#" "SITE" "TYPE" "RULE"
   while IFS= read -r line; do
     parse_line "$line" || continue
     n=$((n + 1))
     site=$(rule_label "$reveal"); [ "$R_HIDDEN" = 1 ] && [ "$reveal" != 1 ] && site="•••••••• (hidden)"
     kind=$(rule_type)
-    printf '  %-4s %-36s %-6s %s\n' "$n" "$site" "$kind" "$(rule_opts)"
+    printf '  %-4s %-36s %-8s %s\n' "$n" "$site" "$kind" "$(rule_opts)"
   done < <(rules_body)
   [ "$n" = 0 ] && info "  (no rules — add one with: noscroll block <site>)"
   return 0
@@ -1770,10 +2106,16 @@ cmd_check() {
   local url="$1" i line
   if [ "$NS_HEX" = 1 ]; then is_hex "$url" || die "'$url' isn't hex"; url=$(hex_decode "$url"); fi
   [[ "$url" == *://* ]] || url="https://$url"
-  i=$(match_url "$url")
-  if [ -z "$i" ]; then info "Allowed: no rule closes this URL."; return 0; fi
-  line=$(rule_at "$i"); parse_line "$line"
-  info "Blocked by rule #$i ($(rule_label))${R_LIMIT:+$( [ "$R_LIMIT" -gt 0 ] && printf ', %s/day' "$(fmt_duration "$R_LIMIT")")}"
+  local hits on
+  hits=$(match_url "$url")
+  if [ -z "$hits" ]; then info "Allowed: no rule closes this URL."; return 0; fi
+  now_local
+  for i in ${hits//,/ }; do
+    line=$(rule_at "$i"); parse_line "$line"
+    if rule_always; then info "Blocked by rule #$i ($(rule_label))"; continue; fi
+    on=""; [ -n "$R_DURING" ] && sched_active "$R_DURING" "$NOW_DOW" "$NOW_MIN" && on=" — downtime is on now"
+    info "Restricted by rule #$i ($(rule_label)): $(rule_opts)$on"
+  done
 }
 
 usage_report() {   # prints "label used limit" for each limited rule
@@ -2034,7 +2376,7 @@ cmd_import() {
     [ "$R_KIND" = allow ] && { info "Skipped an allow rule (use: noscroll allow)."; continue; }
     local pat; pat=$(normalise_pattern "$R_PAT" 2>/dev/null) || { info "Skipped invalid line: $line"; continue; }
     local h=$hide; [ "$R_HIDDEN" = 1 ] && h=1
-    set_rule "$pat" "$h" "$R_GRACE" "$R_LIMIT" import >/dev/null
+    set_rule "$(compose_line block "$pat" "$h" "$R_GRACE" "$R_LIMIT" "$R_DURING")" "Imported" import >/dev/null
     n=$((n + 1))
   done < <(if [ "$src" = - ]; then cat; else cat "$src"; fi)
   info "Imported $n rule(s)."
@@ -2153,15 +2495,18 @@ cmd_doctor() {
 
 cmd_help() {
   cat <<'HELP'
-noscroll — a stubborn website blocker for macOS
+noscroll — a stubborn website and app blocker for macOS
 
 USAGE
   noscroll <command> [args]
 
 RULES                                   tighten = instant · loosen = queued
   block <site>… [--grace 60s]   Block sites (subdomains included)
+  block <site>… <from>-<to> [days]
+                                Downtime: block on a schedule, e.g.
+                                22:00-07:00 · outside 9am-5pm weekdays
   limit <site>… <duration>      Allow this much time per day, e.g. 30m
-  unblock <site|#n>…            Remove a block                   (queued)
+  unblock <site|#n>…            Remove a block or downtime       (queued)
   unlimit <site|#n>…            Remove a time limit              (queued)
   allow <site>…                 Exception that beats any rule    (queued)
   disallow <site|#n>…           Remove an exception
@@ -2181,6 +2526,10 @@ PATTERNS
   reddit.com/r/all              that path and below
   *.example.com                 subdomains only       =m.example.com  exact host
   ~casino                       keyword anywhere in the URL
+  app:Discord                   an app (block, downtime or limit)
+
+DAYS (after a time)
+  weekdays · weekends · daily · mon-fri · sat,sun
 
 CONTROL
   status                        State, mode, usage and pending changes
@@ -2234,6 +2583,7 @@ main() {
     version|--version|-v) info "noscroll $NOSCROLL_VERSION" ;;
     help|--help|-h)    cmd_help ;;
     add|remove)        die "'$cmd' is now 'block' / 'unblock' (see: noscroll help)" ;;
+    downtime)          die "downtime is a schedule on block — e.g. noscroll block reddit.com 22:00-07:00" ;;
     setup-password)    die "'setup-password' is now 'password'" ;;
     *)                 die "unknown command '$cmd' (try: noscroll help)" ;;
   esac

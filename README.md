@@ -2,7 +2,7 @@
 
 # noscroll
 
-**A stubborn website blocker for macOS that's hard to switch off in the moment you want to cave.**
+**A stubborn website and app blocker for macOS that's hard to switch off in the moment you want to cave.**
 
 [![CI](https://github.com/ben47203/noscroll/actions/workflows/ci.yml/badge.svg)](https://github.com/ben47203/noscroll/actions/workflows/ci.yml)
 ![macOS](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
@@ -23,7 +23,7 @@ a 10-minute cooldown, or no password and a 24-hour delay. Changes that
 
 It's one dependency-free bash script. It watches Safari and Chromium-based
 browsers, closes matching tabs within about two seconds of you looking at them,
-and restarts itself if it's killed.
+quits blocked apps, and restarts itself if it's killed.
 
 ```console
 $ noscroll block reddit.com instagram.com
@@ -32,6 +32,9 @@ Blocked instagram.com.
 
 $ noscroll limit youtube.com 30m
 Limited youtube.com to 30m/day.
+
+$ noscroll block app:Discord outside 9am-5pm weekdays
+Downtime for app:discord: blocked outside 09:00–17:00 weekdays.
 
 $ noscroll unblock reddit.com
 Password to unblock:
@@ -46,6 +49,10 @@ Takes effect in 10m (Thu 26 Nov 13:10). Changed your mind? noscroll cancel 1
   paths, exact hosts, keywords and allow-list exceptions.
 - ⏳ **Daily time limits.** For example, 30 minutes of YouTube a day, counted
   only while the tab is in front. You get warnings at 5 minutes and 1 minute.
+- 🌙 **Downtime.** Block a site or app on a schedule, such as `22:00-07:00`
+  every night or `outside 9am-5pm weekdays`. It combines with a time limit.
+- 🧩 **Apps too.** `app:Discord` works anywhere a site does. A blocked app is
+  quit as soon as it's opened or brought to the front.
 - 🔐 **Two unlock modes.** *Password* mode needs your password plus a cooldown.
   *Timer* mode has no password at all, just a long wait. A password is only as
   strong as your willpower to forget it, so timer mode skips it.
@@ -62,7 +69,7 @@ Takes effect in 10m (Thu 26 Nov 13:10). Changed your mind? noscroll cancel 1
   - Any `noscroll` command repairs a broken install.
   - Upgrades go through the same queue.
 - 🔋 **Light on battery.** One long-lived monitor checks the browser in front
-  every 2s, and the ones in the background every 8s. Switching to a browser
+  every 2s, and the ones in the background every 8s. Switching apps
   triggers a check at once. It measures about 1–1.5% of one CPU core (see
   [FAQ](#faq)).
 - 🌐 **Multi-browser.** Safari, Safari Technology Preview, Chrome
@@ -127,12 +134,14 @@ instant. Removing or loosening one goes through the [queue](#unlock-modes).
 | Add | Remove | What it does |
 | --- | --- | --- |
 | `block <site>…` | `unblock <site>…` *(queued)* | close the site on sight |
+| `block <site>… <from>-<to> [days]` | `unblock <site>…` *(queued)* | [downtime](#downtime): block on a schedule |
 | `limit <site>… <time>` | `unlimit <site>…` *(queued)* | allow this much time per day |
 | `allow <site>…` *(queued)* | `disallow <site>…` | an exception that beats any rule |
 
 Any of these also accepts `'#n'` (a number from `noscroll list`) in place of a
-site. `unblock` only removes blocks and `unlimit` only removes limits. If you
-use the wrong one, noscroll tells you which you need.
+site, and `app:Name` in place of a site (except `allow`). `unblock` only
+removes blocks and downtime, and `unlimit` only removes limits. If you use the
+wrong one, noscroll tells you which you need.
 
 ### Patterns
 
@@ -143,6 +152,7 @@ use the wrong one, noscroll tells you which you need.
 | `*.example.com` | subdomains only, not `example.com` itself |
 | `=m.example.com` | exactly that host, nothing else |
 | `~casino` | any URL containing the keyword |
+| `app:Discord` | the app named `Discord.app` (case and spaces don't matter: `app:"Visual Studio Code"`) |
 
 noscroll lower-cases patterns and strips the scheme, `www.` and trailing
 slashes, so pasting a URL works: `noscroll block https://www.tiktok.com/`.
@@ -170,10 +180,11 @@ noscroll config discreet on                   # hide everything, now and in futu
 
 ```console
 $ noscroll list
-  #    SITE                                 TYPE   RULE
+  #    SITE                                 TYPE     RULE
   1    reddit.com                           block
   2    •••••••• (hidden)                    block
-  3    youtube.com                          limit  30m/day
+  3    youtube.com                          limit    30m/day
+  4    app:discord                          downtime blocked 22:00–07:00
 ```
 
 Use `noscroll list --reveal` to see hidden rules. `noscroll hide all`,
@@ -191,8 +202,48 @@ noscroll usage                         # today's time on limited sites
 ```
 
 Time counts only while a matching tab is the active tab and the browser is the
-frontmost app. Time asleep or suspended doesn't count, and the allowance resets
-at local midnight. When it runs out, matching tabs close for the rest of the day.
+frontmost app (for an app, while it's the frontmost app). Time asleep or
+suspended doesn't count, and the allowance resets at local midnight. When it
+runs out, matching tabs close, or the app quits, for the rest of the day.
+
+### Downtime
+
+Downtime is a `block` with a schedule. Outside its hours the site or app works
+normally (subject to any time limit); during them it's blocked.
+
+```sh
+noscroll block reddit.com 22:00-07:00                 # every night, past midnight
+noscroll block app:Steam 9am-5pm weekdays             # during work hours
+noscroll block x.com outside 8am-8pm                  # only allowed 8am–8pm
+noscroll block youtube.com 9-17 weekdays 23-6         # several windows at once
+noscroll limit youtube.com 30m                        # …plus 30 minutes a day outside them
+noscroll unblock reddit.com                           # remove the downtime: queued
+```
+
+- **Times:** `22:00`, `2200`, `22`, `10pm`, `7:30am`. A window that ends before
+  it starts runs past midnight and belongs to the day it starts on, so
+  `22:00-07:00 fri` covers Friday night into Saturday morning.
+- **Days** go after the time they apply to: `weekdays`, `weekends`, `daily`,
+  `mon-fri`, `sat,sun`, `fri`. Without days, a window applies every day.
+- **`outside A-B`** blocks everything except A–B on those days.
+- **Changing it follows the usual rule.** Running `block` again with a schedule
+  that covers every minute the old one did (or more) is instant. Shrinking it,
+  or turning a full block into downtime, is queued.
+- `noscroll check <url>` tells you whether downtime is on right now.
+
+### Apps
+
+Write `app:` and the app's name, as it appears in `/Applications`.
+
+```sh
+noscroll block app:Discord                  # quit it whenever it runs
+noscroll block app:Steam 22:00-07:00        # downtime
+noscroll limit app:"Visual Studio Code" 2h  # time while it's the frontmost app
+```
+
+A blocked app is quit when it comes to the front, and within two checks if it's
+running in the background. It gets the same signal as a normal shutdown, so it
+can save its state. Apps from the Mac App Store and elsewhere work the same way.
 
 ### Unlock modes
 
@@ -258,12 +309,14 @@ something looks wrong.
  │     ├── monitor (one long-lived osascript, JavaScript)
  │     │     glance at the frontmost app every 0.5 s; read every tab of each
  │     │     running browser: every 2 s if a browser is in front, every 8 s if
- │     │     not, immediately when you switch to one
+ │     │     not, immediately when you switch apps
  │     └── for each check:
  │           1. apply queued changes whose delay has passed
- │           2. match every URL against your rules     (awk, only if tabs changed)
- │           3. close matches, count time on limited sites
- │           4. restart the watchdog if it's gone
+ │           2. work out which downtime windows are on   (once a minute)
+ │           3. quit blocked apps
+ │           4. match every URL against your rules     (awk, only if tabs changed)
+ │           5. close matches, count time on limited sites and apps
+ │           6. restart the watchdog if it's gone
  │
  └── com.noscroll.agent.watchdog   every 30 s
        restart / re-enable the agent unless a legitimate stop is in force
@@ -305,7 +358,8 @@ These are the bypasses that remain, even for someone who has read the source:
 | An unmonitored browser (Firefox, a Dock web app, a phone) | noscroll can only see scriptable browsers | `config strict on` quits known browsers it can't monitor |
 | Revoking **Automation** permission | The agent can no longer read tabs | Strict mode quits a browser that refuses control |
 | Killing the agent, then forging state before it restarts | A fresh agent has no memory to compare against | Needs the secret, the signature format and good timing |
-| Setting the clock forward | Waits are measured in wall-clock time | Changing the clock needs an admin password |
+| Setting the clock forward, or changing time zone during downtime | Waits and downtime use the system clock | Changing the clock or time zone needs an admin password |
+| Renaming or copying an app bundle | App rules match the `.app` name | Block the copy too |
 | Proxy and mirror sites (translate proxies, alternative frontends) | They're different domains | Block them too, or use `~keyword` rules |
 
 For a lock you can't pick yourself, have someone else hold the admin password,

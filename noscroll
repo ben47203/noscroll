@@ -381,7 +381,7 @@ load_cfg_cache() {
 }
 
 # v2.0 used one "delay" (meaning cooldown or timer by mode) and
-# "recovery_delay", plus separate recovery codes. Rename / drop them.
+# "recovery_delay". Rename them, and delete v2.0's leftover second-secret file.
 migrate_config() {
   [ -f "$F_RECOVERY_OLD" ] && sremove "$F_RECOVERY_OLD"
   local body; body="$(sbody "$F_CONFIG")"
@@ -2224,9 +2224,9 @@ cmd_forgot() {
     return 0
   fi
   local d; d=$(recover_secs)
-  info "Recovery mode: noscroll will clear your password and stop blocking"
-  info "after $(fmt_duration "$d"). No password is needed for this. You can cancel any time."
-  confirm "Start recovery?" || { info "Not started."; return 0; }
+  info "Forgot your password? noscroll will clear it and stop blocking after"
+  info "$(fmt_duration "$d"). No password is needed for this. You can cancel any time."
+  confirm "Start the wait?" || { info "Not started."; return 0; }
   AUTH_IMMEDIATE=0
   queue_action recover "" "Forgotten password: clear it and stop the blocker" "$d"
   info "When it's done: noscroll password && noscroll start"
@@ -2487,7 +2487,7 @@ noscroll — a stubborn website and app blocker for macOS
 USAGE
   noscroll <command> [args]
 
-RULES                                   tighten = instant · loosen = queued
+RULES                     tighten = instant, no password · loosen = password/wait
   block <site>… [--grace 60s]   Block sites (subdomains included)
   block <site>… <from>-<to> [days]
                                 Downtime: block on a schedule, e.g.

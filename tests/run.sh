@@ -325,10 +325,10 @@ run cancel all >/dev/null
 # Forgot password (password mode) waits the recover length.
 apply_action config "mode=password"
 run forgot </dev/null | grep -q "Takes effect in 2d" && ok || fail "forgot waits recover"
-run pending | grep -q "Forgotten password" && ok || fail "recovery is pending"
+run pending | grep -q "Forgotten password" && ok || fail "forgot is pending"
 ff
-has_password && fail "recovery cleared the password" || ok
-is_stopped && ok || fail "recovery stopped the blocker"
+has_password && fail "forgot cleared the password" || ok
+is_stopped && ok || fail "forgot stopped the blocker"
 
 # While stopped, changes apply immediately.
 run unblock instagram.com | grep -q "Done" && ok || fail "stopped: unblock is immediate"
@@ -341,7 +341,7 @@ printf 'x\n' | swrite "$F_RECOVERY_OLD" protect
 migrate_config
 eq "delay → timer" "$(cfg timer)" 7200
 eq "recovery_delay → recover" "$(cfg recover)" 90000
-[ -f "$F_RECOVERY_OLD" ] && fail "old recovery code removed" || ok
+[ -f "$F_RECOVERY_OLD" ] && fail "v2.0 leftover file removed" || ok
 
 # Binary swapped or deleted → restored from the signed copy.
 chflags nouchg "$NOSCROLL_APP_DIR/noscroll"; printf '#!/bin/bash\nexit 0\n' > "$NOSCROLL_APP_DIR/noscroll"

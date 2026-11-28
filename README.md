@@ -129,7 +129,9 @@ noscroll check https://old.reddit.com/r/pics   # "would this be closed?"
 ### Commands at a glance
 
 Every restriction has an obvious inverse. Adding or tightening a restriction is
-instant. Removing or loosening one goes through the [queue](#unlock-modes).
+instant and never asks for a password. Removing or loosening one needs your
+password (or, in timer mode, just the wait) and goes through the
+[queue](#unlock-modes).
 
 | Add | Remove | What it does |
 | --- | --- | --- |
@@ -428,8 +430,7 @@ first; `noscroll import my-rules.txt` restores them later.
 
 **Upgrading?** Run `./install.sh`. From v1, your blocklist, grace periods and
 password migrate automatically, and the old agent is replaced. From 2.0,
-`delay`/`recovery_delay` become `cooldown`/`timer`/`recover`, and recovery
-codes are removed. v1 matched
+`delay`/`recovery_delay` become `cooldown`/`timer`/`recover`. v1 matched
 anywhere in the URL. v2 matches domains, so v1 entries that weren't domains
 become `~keyword` rules and keep working as before.
 

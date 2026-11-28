@@ -1540,28 +1540,15 @@ queue_action() {
 # launchd entry point: copy to /tmp under a random system process name.
 run_daemon() {
   ensure_home
-  local name dest
-  name=$(ps -axo comm= 2>/dev/null | grep -E '^/(System|usr)/' | sort -u |
-         awk 'BEGIN { srand() } { a[NR] = $0 } END { if (NR) print a[int(rand() * NR) + 1] }')
-  name=$(basename "${name:-cfprefsd}")
-  dest="/tmp/$name"
-  export NOSCROLL_RUN=loop
-  # Reuse a stale copy of ourselves, but never clobber a foreign file.
-  if [ -e "$dest" ] && ! grep -q 'NOSCROLL_VERSION=' "$dest" 2>/dev/null; then dest=""; fi
-  if [ -n "$dest" ] && cp -f "$0" "$dest" 2>/dev/null; then
-    chmod 700 "$dest"
-    export NOSCROLL_SELF="$dest"
-    exec -a "$name" /bin/bash "$dest"
-  fi
-  export NOSCROLL_SELF="$0"
-  daemon_loop
+  export NOSCROLL_RUN=loop NOSCROLL_SELF="$0"
+  # Shows up as "noscroll" in Activity Monitor and ps, not "bash".
+  exec -a noscroll /bin/bash "$0"
 }
 
 daemon_cleanup() {
   monitor_stop
   rm -f "$NS_HOME/.monitor"
   persist_usage
-  [[ "$NS_SELF" == /tmp/* ]] && rm -f "$NS_SELF"
   rm -f "$F_TABS" "$F_RULES_TSV"
 }
 

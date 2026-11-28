@@ -342,8 +342,9 @@ something looks wrong.
 - **Every command heals.** Running any `noscroll` command re-creates missing
   agents, clears launchd `disable` overrides and restarts what should be
   running.
-- **It runs under a disguise.** The agent runs from a copy in `/tmp` named after
-  a random system process, so it doesn't stand out in Activity Monitor.
+- **No disguise.** The agent shows up as `noscroll` in Activity Monitor.
+  Hiding it wouldn't stop the person who installed it, and killing it is
+  pointless anyway: launchd starts it again.
 
 ### Threat model: what can still beat it
 

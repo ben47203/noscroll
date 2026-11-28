@@ -4,6 +4,13 @@ All notable changes to noscroll. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- The agent runs as `noscroll` from its install location instead of a copy
+  in `/tmp` named after a random system process. The disguise didn't stop
+  anyone who knew it was there, and it looks like malware to security tools.
+
 ## [2.2.0] - 2026-11-28
 
 ### Added
